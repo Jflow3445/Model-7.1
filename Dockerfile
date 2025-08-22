@@ -35,7 +35,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # App files and boot scripts (unchanged)
 COPY app/ ./app/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint
-COPY docker/config/app.env.example /opt/defaults/app.env
 RUN chmod +x /usr/local/bin/entrypoint && \
     mkdir -p /workspace/config /workspace/data && \
     chown -R appuser:appuser /workspace
