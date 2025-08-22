@@ -7,32 +7,38 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    PIP_DEFAULT_TIMEOUT=120
 
+# OS deps (+ build tools for wheels that need compiling)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-pip ca-certificates tzdata curl git tini \
+      build-essential gcc g++ libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root
+# Non-root user and working dir
 RUN useradd -m -u 1000 appuser
-WORKDIR /workspace/app
+WORKDIR /workspace
 
-# Venv + deps
-RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --upgrade pip wheel
-# you committed requirements-lock.txt; use it as requirements
-COPY requirements-lock.txt ./requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+# Venv + latest pip/wheel
+RUN python3 -m venv /opt/venv && pip install --upgrade pip wheel
 
-# Copy source (relies on .dockerignore to exclude logs/venvs/data/.git)
+# === requirements ===
+# If you have "requirements-lock.txt", either rename it to requirements.txt in git,
+# or copy it as requirements.txt here. Pick ONE approach. This example expects requirements.txt.
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+# Entrypoints & app files
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint \
+    && mkdir -p /workspace/config /workspace/data \
+    && chown -R appuser:appuser /workspace
+
+# Copy your source tree last (better cache usage for pip step)
 COPY . .
 
-# Entry + defaults (skip missing app.env.example)
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint
-RUN chmod +x /usr/local/bin/entrypoint && \
-    mkdir -p /workspace/config /workspace/data && \
-    chown -R appuser:appuser /workspace
-
-# (No healthcheck since this isn’t a web app)
 USER appuser
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/entrypoint"]
-CMD ["python","main.py"]
+CMD ["bash"]   # <— default to a shell so you can run any script
