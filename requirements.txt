@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
 # === RL stack ===
 stable_baselines3==2.7.0
 sb3_contrib==2.7.0
@@ -5,7 +6,7 @@ gymnasium>=0.29,<1.0            # SB3 2.7 isn't on Gymnasium 1.x yet
 Farama-Notifications==0.0.4
 
 # === Numeric / plotting ===
-numpy==2.3.2
+torch==2.5.1+cu121
 pandas==2.3.2
 matplotlib==3.10.5
 contourpy==1.3.3
