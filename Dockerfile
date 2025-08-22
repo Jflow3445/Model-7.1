@@ -9,22 +9,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
     PIP_INDEX_URL=https://pypi.org/simple \
-    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121
+    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121 \
+    PIP_PREFER_BINARY=1
 
+# OS deps + Python 3.11
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-pip ca-certificates tzdata curl git tini \
-    && rm -rf /var/lib/apt/lists/*
+      ca-certificates tzdata curl git tini software-properties-common gnupg \
+ && add-apt-repository ppa:deadsnakes/ppa -y \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv python3.11-distutils \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
-# venv
-RUN python3 -m venv /opt/venv && pip install --upgrade pip wheel
+# Create venv on Python 3.11 and upgrade build tooling
+RUN /usr/bin/python3.11 -m venv /opt/venv \
+ && pip install --upgrade pip wheel setuptools
 
-# deps
+# Install Python deps (wheels only)
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --prefer-binary numpy==2.2.6 && \
     pip install --only-binary=:all: -r requirements.txt
 
-# keep runtime simple so you can run scripts yourself
+# Default to interactive shell so you can run any script
 CMD ["bash"]

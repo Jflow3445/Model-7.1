@@ -1,7 +1,10 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
 
-# core first
-numpy==2.2.6
+# Python/NumPy compatibility
+numpy==2.3.2; python_version >= "3.11"
+numpy==2.2.6; python_version < "3.11"
+
+# CUDA PyTorch
 torch==2.5.1+cu121
 
 # RL stack
