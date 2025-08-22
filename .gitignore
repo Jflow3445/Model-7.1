@@ -1,0 +1,16 @@
+﻿# envs & caches
+.venv*/ 
+venv*/ 
+.env*/ 
+__pycache__/ 
+.pytest_cache/
+
+*.log
+*.pt *.pth *.pkl *.bin *.ckpt *.onnx
+wandb/
+mlruns/
+outputs/
+
+# logs
+*.log
+logs/
