@@ -23,6 +23,11 @@ WORKDIR /workspace
 
 # Isolated venv
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --upgrade pip wheel
+# before: pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip wheel && \
+    pip install --prefer-binary numpy==2.2.6 && \
+    pip install --prefer-binary -r requirements.txt
 
 # Install deps
 COPY requirements.txt .

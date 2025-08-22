@@ -1,12 +1,16 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
-# === RL stack ===
+
+# Core first (to avoid resolver thrash)
+numpy==2.2.6
+torch==2.5.1+cu121
+
+# RL stack
 stable_baselines3==2.7.0
 sb3_contrib==2.7.0
-gymnasium>=0.29,<1.0            # SB3 2.7 isn't on Gymnasium 1.x yet
+gymnasium==0.29.1
 Farama-Notifications==0.0.4
 
-# === Numeric / plotting ===
-torch==2.5.1+cu121
+# Numeric / plotting
 pandas==2.3.2
 matplotlib==3.10.5
 contourpy==1.3.3
@@ -22,7 +26,7 @@ networkx==3.5
 sympy==1.13.1
 mpmath==1.3.0
 
-# === TB / protobuf / gRPC ===
+# TB / protobuf / gRPC
 tensorboard<3
 protobuf<6
 grpcio==1.74.0
@@ -30,7 +34,7 @@ absl-py==2.3.1
 Markdown==3.8.2
 Werkzeug==3.1.3
 
-# === IO / misc ===
+# IO / misc
 filelock==3.19.1
 fsspec>=2024.3.0
 httpx==0.28.1
@@ -42,5 +46,5 @@ certifi==2025.8.3
 Jinja2==3.1.6
 MarkupSafe==3.0.2
 
-# === Windows-only ===
+# Windows-only
 MetaTrader5==5.0.5200 ; platform_system == "Windows"
