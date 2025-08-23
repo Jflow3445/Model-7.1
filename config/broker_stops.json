@@ -1,0 +1,512 @@
+{
+  "EURUSD": {
+    "found": true,
+    "broker_symbol": "EURUSD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDJPY": {
+    "found": true,
+    "broker_symbol": "USDJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPUSD": {
+    "found": true,
+    "broker_symbol": "GBPUSD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDCAD": {
+    "found": true,
+    "broker_symbol": "USDCAD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDCHF": {
+    "found": true,
+    "broker_symbol": "USDCHF",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "NZDUSD": {
+    "found": true,
+    "broker_symbol": "NZDUSD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "XAUUSD": {
+    "found": true,
+    "broker_symbol": "XAUUSD",
+    "digits": 2,
+    "point": 0.01,
+    "pip_size": 0.1,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "AUDCAD": {
+    "found": true,
+    "broker_symbol": "AUDCAD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "AUDUSD": {
+    "found": true,
+    "broker_symbol": "AUDUSD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "CADCHF": {
+    "found": true,
+    "broker_symbol": "CADCHF",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "CADJPY": {
+    "found": true,
+    "broker_symbol": "CADJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "CADSGD": {
+    "found": true,
+    "broker_symbol": "CADSGD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "CHFJPY": {
+    "found": true,
+    "broker_symbol": "CHFJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURAUD": {
+    "found": true,
+    "broker_symbol": "EURAUD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURCAD": {
+    "found": true,
+    "broker_symbol": "EURCAD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURCHF": {
+    "found": true,
+    "broker_symbol": "EURCHF",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURJPY": {
+    "found": true,
+    "broker_symbol": "EURJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURNZD": {
+    "found": true,
+    "broker_symbol": "EURNZD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPAUD": {
+    "found": true,
+    "broker_symbol": "GBPAUD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPCAD": {
+    "found": true,
+    "broker_symbol": "GBPCAD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPCHF": {
+    "found": true,
+    "broker_symbol": "GBPCHF",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPJPY": {
+    "found": true,
+    "broker_symbol": "GBPJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPNZD": {
+    "found": true,
+    "broker_symbol": "GBPNZD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "NZDJPY": {
+    "found": true,
+    "broker_symbol": "NZDJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "XAGEUR": {
+    "found": true,
+    "broker_symbol": "XAGEUR",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "XAGUSD": {
+    "found": true,
+    "broker_symbol": "XAGUSD",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "XAUAUD": {
+    "found": true,
+    "broker_symbol": "XAUAUD",
+    "digits": 2,
+    "point": 0.01,
+    "pip_size": 0.1,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "XAUEUR": {
+    "found": true,
+    "broker_symbol": "XAUEUR",
+    "digits": 2,
+    "point": 0.01,
+    "pip_size": 0.1,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDSGD": {
+    "found": true,
+    "broker_symbol": "USDSGD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDCZK": {
+    "found": true,
+    "broker_symbol": "USDCZK",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDHUF": {
+    "found": true,
+    "broker_symbol": "USDHUF",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDMXN": {
+    "found": true,
+    "broker_symbol": "USDMXN",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDNOK": {
+    "found": true,
+    "broker_symbol": "USDNOK",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "SGDJPY": {
+    "found": true,
+    "broker_symbol": "SGDJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "AUDNZD": {
+    "found": true,
+    "broker_symbol": "AUDNZD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDPLN": {
+    "found": true,
+    "broker_symbol": "USDPLN",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDSEK": {
+    "found": true,
+    "broker_symbol": "USDSEK",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDCNH": {
+    "found": true,
+    "broker_symbol": "USDCNH",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "NZDCAD": {
+    "found": true,
+    "broker_symbol": "NZDCAD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDTRY": {
+    "found": true,
+    "broker_symbol": "USDTRY",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "USDZAR": {
+    "found": true,
+    "broker_symbol": "USDZAR",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "ZARJPY": {
+    "found": true,
+    "broker_symbol": "ZARJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "NZDCHF": {
+    "found": true,
+    "broker_symbol": "NZDCHF",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "AUDCHF": {
+    "found": true,
+    "broker_symbol": "AUDCHF",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURGBP": {
+    "found": true,
+    "broker_symbol": "EURGBP",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "AUDJPY": {
+    "found": true,
+    "broker_symbol": "AUDJPY",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "CHFSGD": {
+    "found": true,
+    "broker_symbol": "CHFSGD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "NZDSGD": {
+    "found": true,
+    "broker_symbol": "NZDSGD",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "NZDHUF": {
+    "found": true,
+    "broker_symbol": "NZDHUF",
+    "digits": 3,
+    "point": 0.001,
+    "pip_size": 0.01,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "EURCNH": {
+    "found": true,
+    "broker_symbol": "EURCNH",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  },
+  "GBPDKK": {
+    "found": true,
+    "broker_symbol": "GBPDKK",
+    "digits": 5,
+    "point": 1e-05,
+    "pip_size": 0.0001,
+    "min_stop_points": 0,
+    "min_stop_pips": 0.0,
+    "min_stop_price": 0.0
+  }
+}
