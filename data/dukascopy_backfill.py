@@ -45,7 +45,7 @@ RETRY_BASE_SLEEP     = float(os.getenv("POLY_RETRY_BASE_SLEEP", "0.5"))
 CHUNK_DAYS           = int(os.getenv("POLY_CHUNK_DAYS", "30"))    # keep under Polygon 50k/min cap
 MERGE_EVERY_CHUNKS   = int(os.getenv("POLY_MERGE_EVERY_CHUNKS", "6"))
 WRITE_LAG_MINUTES    = int(os.getenv("POLY_WRITE_LAG_MINUTES", "3"))  # avoid partial last bar
-USE_HTTP2            = bool(int(os.getenv("POLY_HTTP2", "1")))
+USE_HTTP2            = bool(int(os.getenv("POLY_HTTP2", "0")))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # File locking for atomic merges
@@ -95,33 +95,38 @@ def _standardize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     return out[cols]
 
 def _merge_save_atomic(target_csv: Path, new_df: pd.DataFrame) -> int:
-    """
-    Merge new_df into target_csv by index (UTC datetime), drop dups, atomic replace.
-    Returns count of newly added rows.
-    """
     if new_df is None or new_df.empty:
         return 0
+    target_csv = Path(target_csv)
     new_df = _standardize_ohlc(new_df)
     target_csv.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target_csv.with_suffix(target_csv.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+
     lock = FileLock(str(target_csv) + ".lock")
     with lock:
-        if target_csv.exists():
-            try:
-                existing = pd.read_csv(target_csv, parse_dates=["time"], index_col="time")
-            except Exception:
-                existing = pd.read_csv(target_csv, index_col=0, parse_dates=True)
-                existing.index.name = "time"
-            existing = _standardize_ohlc(existing)
-            before = len(existing)
-            merged = pd.concat([existing, new_df[~new_df.index.isin(existing.index)]], axis=0)
-            added = len(merged) - before
-        else:
-            merged = new_df
-            added = len(new_df)
-        tmp = target_csv.with_suffix(target_csv.suffix + ".tmp")
-        merged.to_csv(tmp, index=True)
-        os.replace(tmp, target_csv)
-    return added
+        try:
+            if target_csv.exists():
+                try:
+                    existing = pd.read_csv(target_csv, parse_dates=["time"], index_col="time")
+                except Exception:
+                    existing = pd.read_csv(target_csv, index_col=0, parse_dates=True)
+                    existing.index.name = "time"
+                existing = _standardize_ohlc(existing)
+                before = len(existing)
+                merged = pd.concat([existing, new_df[~new_df.index.isin(existing.index)]], axis=0)
+                added = len(merged) - before
+            else:
+                merged = new_df
+                added = len(new_df)
+            merged.to_csv(tmp, index=True)
+            os.replace(tmp, target_csv)
+            return added
+        except FileNotFoundError as e:
+            missing = getattr(e, "filename", None) or getattr(e, "filename2", None) or str(tmp)
+            print(f"[PolygonBackfill] FILE NOT FOUND while writing → {missing}")
+            raise
+
 
 def _latest_timestamp(csv_path: Path) -> Optional[pd.Timestamp]:
     if not csv_path.exists():
@@ -241,19 +246,19 @@ def _chunk_windows(start: dt.datetime, end: dt.datetime, days: int) -> List[Tupl
 # ──────────────────────────────────────────────────────────────────────────────
 # Resampling (minute → hourly / daily) — hardened tz logic
 # ──────────────────────────────────────────────────────────────────────────────
+# in data/dukascopy_backfill.py
 def _resample_minute_to_hourly(m1: pd.DataFrame) -> pd.DataFrame:
-    """
-    Minute → Hourly OHLCV in UTC.
-    """
     if m1 is None or m1.empty:
         return _standardize_ohlc(pd.DataFrame(columns=["open","high","low","close","volume"]))
-    m1 = _standardize_ohlc(m1)  # ensures UTC tz-aware
+    m1 = _standardize_ohlc(m1)
     o = m1["open"].resample("1h").first()
     h = m1["high"].resample("1h").max()
     l = m1["low"].resample("1h").min()
     c = m1["close"].resample("1h").last()
     v = m1["volume"].resample("1h").sum(min_count=1)
-    return _standardize_ohlc(pd.concat([o, h, l, c, v], axis=1))
+    out = pd.concat([o, h, l, c, v], axis=1)
+    out = out.dropna(how="all")          # ← drop empty hours
+    return _standardize_ohlc(out)
 
 def _resample_minute_to_daily(
     m1: pd.DataFrame,
@@ -334,8 +339,17 @@ def backfill_symbol(
     hourly_csv = Path(hourly_csv_dir)  / f"{symbol}_hourly.csv"
     daily_csv  = Path(one_min_csv_dir) / f"{symbol}_daily.csv"
 
+    # NEW: make sure all parent dirs exist even if we end up not writing anything
+    for p in (minute_csv, hourly_csv, daily_csv):
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # If even this fails, better to surface the path in the outer handler
+            pass
+
     if resume:
         start = _resume_start_from_existing(start, minute_csv, hourly_csv)
+
 
     if end <= start:
         return {"1min": 0, "hourly": 0, "daily": 0}
@@ -385,14 +399,18 @@ def backfill_symbol(
         added_min_total += flush_minute_batch()
 
     # Load the updated minute file (restrict to the request window to keep it light)
-    try:
-        m1 = pd.read_csv(minute_csv, parse_dates=["time"], index_col="time")
-    except Exception:
-        m1 = pd.read_csv(minute_csv, index_col=0, parse_dates=True)
-        m1.index.name = "time"
-    m1 = _standardize_ohlc(m1)
-    m1 = m1[(m1.index >= pd.to_datetime(start, utc=True)) & (m1.index <= pd.to_datetime(end, utc=True))]
-
+    # Load the updated minute file (restrict to the request window to keep it light)
+    if minute_csv.exists():
+        try:
+            m1 = pd.read_csv(minute_csv, parse_dates=["time"], index_col="time")
+        except Exception:
+            m1 = pd.read_csv(minute_csv, index_col=0, parse_dates=True)
+            m1.index.name = "time"
+        m1 = _standardize_ohlc(m1)
+        m1 = m1[(m1.index >= pd.to_datetime(start, utc=True)) & (m1.index <= pd.to_datetime(end, utc=True))]
+    else:
+        # No minute data was written (e.g., empty API response) → skip resampling
+        m1 = _standardize_ohlc(pd.DataFrame(columns=["open","high","low","close","volume"]))
     # Rebuild H1 directly from M1
     h1 = _resample_minute_to_hourly(m1)
     if not h1.empty:
@@ -460,12 +478,18 @@ def backfill_all_pairs(
 
     def _do(sym: str) -> Tuple[str, Dict[str, int]]:
         try:
-            res = backfill_symbol(sym, start, end, resume=resume, max_workers=symbol_workers)
-            return sym, res
-        except Exception as e:
-            print(f"[PolygonBackfill] {sym}: ERROR {e}")
+            return sym, backfill_symbol(sym, start, end, resume=resume, max_workers=symbol_workers)
+        except FileNotFoundError as e:
+            import traceback
+            missing = getattr(e, "filename", None) or getattr(e, "filename2", None) or "<unknown>"
+            print(f"[PolygonBackfill] {sym}: FILE NOT FOUND → {missing}")
+            print(traceback.format_exc())
             return sym, {"1min": 0, "hourly": 0, "daily": 0}
-
+        except Exception:
+            import traceback
+            print(f"[PolygonBackfill] {sym}: ERROR\n{traceback.format_exc()}")
+            return sym, {"1min": 0, "hourly": 0, "daily": 0}
+        
     with cf.ThreadPoolExecutor(max_workers=PAIRS_MAX_WORKERS) as pool:
         for sym, res in pool.map(_do, list(pairs)):
             results[sym] = res

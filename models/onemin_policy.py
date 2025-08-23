@@ -121,10 +121,15 @@ class AttnPool1D(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 class OneMinFeatureExtractor(BaseFeaturesExtractor):
     """
-    Advanced hourly OHLC extractor:
-      • Multi-scale DS-TCN + Token Transformer + AttnPool + Cross-asset + SE
-      • Extras identical to long extractor for head compatibility
-    Obs per-asset: [open, high, low, close] * window + [elapsed]
+    Drop-in replacement (keeps features_dim = n_assets * (embed_dim + 5)):
+      • DS-TCN + Token Transformer + AttnPool + Cross-asset + SE (unchanged)
+      • Extras redesigned for trend-change sensitivity (still 5 per-asset):
+          1) mean_logret (trend)
+          2) atr_pct     (scale-free range)
+          3) macd_delta  (acceleration, normalized, bounded)
+          4) ER_now      (efficiency ratio: trend vs noise)
+          5) rolling_corr (vs base asset; confirmations/divergences)
+    Obs per-asset: [open, high, low, close] * window + [elapsed]  (unchanged)
     """
     def __init__(
         self,
@@ -143,6 +148,7 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         per_asset = obs_dim // n_assets
         assert per_asset == 4 * window + 1, f"per_asset={per_asset} != 4*window+1={4*window+1}"
 
+        # Keep features_dim identical to the old extractor: embed_dim + 5 per asset
         super().__init__(observation_space, features_dim=n_assets * (embed_dim + 5))
         self.n_assets = n_assets
         self.window = window
@@ -169,6 +175,8 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         self.cross = CrossAssetAttention(embed_dim, n_heads, dropout)
         self.final_ln = nn.LayerNorm(embed_dim)
         self.final_drop = nn.Dropout(dropout)
+
+        # Keep output projection shape identical for head compatibility
         self.out_proj = nn.Linear(self._features_dim, self._features_dim)
 
         self.register_buffer("asset_idx", torch.arange(n_assets))
@@ -182,67 +190,129 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         B = obs.size(0)
         obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # [B, N, per_asset], then slice bars -> [B, N, W, 4]
         obs = obs.reshape(B, self.n_assets, self.per_asset)
         bars = obs[:, :, : 4 * self.window].reshape(B, self.n_assets, self.window, 4)
-        tok = self.token(self.in_ln(bars))
 
-        x_cnn = bars.permute(0, 1, 3, 2).contiguous()  # [B,N,4,W]
+        # Token path
+        tok = self.token(self.in_ln(bars))  # [B,N,W,E]
+
+        # DS-TCN path on channels-first then back
+        x_cnn = bars.permute(0, 1, 3, 2).contiguous()                   # [B,N,4,W]
         x_cnn = x_cnn.reshape(B * self.n_assets, 4, self.window)
-        x_cnn = self.tcn3(self.tcn2(self.tcn1(x_cnn))) # [B*N,E,W]
+        x_cnn = self.tcn3(self.tcn2(self.tcn1(x_cnn)))                  # [B*N,E,W]
         x_cnn = self.se(x_cnn)
         x_cnn = x_cnn.permute(0, 2, 1).reshape(B, self.n_assets, self.window, self.embed_dim)
 
+        # Fuse + positions
         fused = tok + x_cnn
         a = self.asset_pos(self.asset_idx).view(1, self.n_assets, 1, self.embed_dim)
         t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
         fused = fused + a + t
 
+        # Transformer over flattened time×asset tokens
         seq = fused.reshape(B, self.n_assets * self.window, self.embed_dim)
         y = self.blocks(seq)
         y = self.final_ln(y)
         y = y.reshape(B, self.n_assets, self.window, self.embed_dim)
 
-        # pool over TIME per asset: (B, N, W, E) -> (B*N, W, E) -> (B*N, E) -> (B, N, E)
+        # Attention pool over TIME per asset
         y = y.reshape(B * self.n_assets, self.window, self.embed_dim)
-        y = self.time_pool(y)
+        y = self.time_pool(y)                                             # [B*N,E]
         y = y.reshape(B, self.n_assets, self.embed_dim)
+        y = self.cross(y)                                                 # cross-asset
+        y = self.final_drop(y)                                            # [B,N,E]
 
-        y = self.cross(y)
-        y = self.final_drop(y)
+        # ── Extras engineered for trend-change sensitivity (5 per asset) ──────
+        eps = 1e-6
+        open_  = bars[..., 0]                                             # [B,N,W]
+        high_  = bars[..., 1]
+        low_   = bars[..., 2]
+        close_ = bars[..., 3]
 
-        open_ = bars[..., 0]; high_ = bars[..., 1]; low_ = bars[..., 2]; close_ = bars[..., 3]
-        momentum   = (close_ - open_).mean(dim=2)
-        volatility = (close_ - open_).std(dim=2, unbiased=False)
-        spread     = (high_ - low_).mean(dim=2)
+        # 1) mean_logret on CLOSE (trend strength, scale-free)
+        if self.window >= 2:
+            log_ret = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))   # [B,N,W-1]
+            mean_logret = log_ret.mean(dim=2)                                         # [B,N]
+        else:
+            mean_logret = torch.zeros(B, self.n_assets, device=obs.device)
 
-        base = close_[:, 0, :] - open_[:, 0, :]
-        base_c = base - base.mean(dim=1, keepdim=True)
-        base_std = base_c.std(dim=1, unbiased=False) + 1e-6
-        corr_list = []
-        for i in range(self.n_assets):
-            if i == 0:
-                corr_list.append(torch.ones(B, device=obs.device))
-            else:
-                r = close_[:, i, :] - open_[:, i, :]
-                r_c = r - r.mean(dim=1, keepdim=True)
-                r_std = r_c.std(dim=1, unbiased=False) + 1e-6
-                corr_list.append(torch.tanh((base_c * r_c).mean(dim=1) / (base_std * r_std)))
-        rolling_corr = torch.stack(corr_list, dim=1)
+        # 2) atr_pct: scale-invariant range signal
+        atr_pct = (high_ - low_).mean(dim=2) / (close_.abs().mean(dim=2) + eps)       # [B,N]
 
-        mean_close = close_.mean(dim=2)
-        mean_open  = open_.mean(dim=2)
-        regime_hint = torch.tanh((mean_close - mean_open) / (mean_open.abs() + 1e-6))
+        # 3) macd_delta (normalized, bounded): captures inflection/acceleration
+        def _ema(x: torch.Tensor, span: int) -> torch.Tensor:
+            # x: [B,N,W] -> same shape; in-graph, O(W)
+            alpha = 2.0 / (float(span) + 1.0)
+            out = torch.zeros_like(x)
+            out[..., 0] = x[..., 0]
+            for t in range(1, x.size(-1)):
+                out[..., t] = alpha * x[..., t] + (1.0 - alpha) * out[..., t - 1]
+            return out
 
-        y_flat = y.reshape(B, -1)
-        extras = torch.cat([momentum, volatility, spread, rolling_corr, regime_hint], dim=1)  # [B,N*5]
-        feats = torch.cat([y_flat, extras], dim=1)
+        if self.window >= 3:
+            fast = max(2, self.window // 4)
+            slow = max(fast + 1, self.window // 2)
+            ema_fast = _ema(close_, fast)
+            ema_slow = _ema(close_, slow)
+            macd = ema_fast - ema_slow                                      # [B,N,W]
+            atr_norm = ((high_ - low_).clamp(min=eps).mean(dim=2) + eps).unsqueeze(-1)  # [B,N,1]
+            macd_norm = macd / atr_norm
+            macd_delta = macd_norm[..., -1] - macd_norm[..., -2]            # [B,N]
+            macd_delta = torch.tanh(macd_delta)                              # bounded [-1,1]
+        else:
+            macd_delta = torch.zeros(B, self.n_assets, device=obs.device)
+
+        # 4) ER_now: Kaufman Efficiency Ratio (trend vs noise) over ~W/6
+        def _efficiency_ratio(c: torch.Tensor, period: int) -> torch.Tensor:
+            period = min(max(3, period), c.size(-1) - 1)
+            if period <= 1:
+                return torch.zeros_like(c[..., 0])
+            end = c[..., -1]
+            start = c[..., -period - 1]
+            num = (end - start).abs()                                       # [B,N]
+            diffs = (c[..., -period:] - c[..., -period - 1:-1]).abs()       # [B,N,period]
+            den = diffs.sum(dim=-1) + eps
+            return (num / den).clamp(0.0, 1.0)
+
+        ER_now = _efficiency_ratio(close_, max(3, self.window // 6))        # [B,N]
+
+        # 5) rolling_corr vs base asset (asset 0) on returns (divergence/confirmation)
+        if self.window >= 2:
+            base = log_ret[:, 0, :]                                         # [B,W-1]
+            base_c = base - base.mean(dim=1, keepdim=True)
+            base_std = base_c.std(dim=1, unbiased=False) + eps
+            corr_list = []
+            for i in range(self.n_assets):
+                if i == 0:
+                    corr_list.append(torch.ones(B, device=obs.device))
+                else:
+                    r = log_ret[:, i, :]
+                    r_c = r - r.mean(dim=1, keepdim=True)
+                    r_std = r_c.std(dim=1, unbiased=False) + eps
+                    corr_list.append(torch.tanh((base_c * r_c).mean(dim=1) / (base_std * r_std)))
+            rolling_corr = torch.stack(corr_list, dim=1)                     # [B,N]
+        else:
+            rolling_corr = torch.ones(B, self.n_assets, device=obs.device)
+
+        # Assemble 5-per-asset extras (order stable)
+        extras = torch.cat([
+            mean_logret,   # 1
+            atr_pct,       # 2
+            macd_delta,    # 3
+            ER_now,        # 4
+            rolling_corr   # 5
+        ], dim=1)  # [B, N*5]
+
+        # Concatenate pooled transformer features with extras
+        y_flat = y.reshape(B, -1)                       # [B, N*E]
+        feats = torch.cat([y_flat, extras], dim=1)      # [B, N*(E + 5)]
         out = self.out_proj(feats)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     @property
     def features_dim(self) -> int:
         return self._features_dim
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Hybrid distribution (identical to long)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,7 +376,14 @@ class HybridActionDistribution(Distribution):
         return cat_lp + cont_lp
 
     def entropy(self) -> torch.Tensor:
-        return self._cat().entropy().sum(dim=1) + self.cont_dist.entropy()
+        disc_ent = self._cat().entropy().sum(dim=1)
+        cont_ent = self.cont_dist.entropy()
+        if cont_ent is None:
+            # SquashedDiagGaussianDistribution may not provide a closed-form entropy.
+            # Use zero as a safe fallback (keeps PPO running; you can later add
+            # a Monte Carlo estimate if you want a stronger entropy bonus).
+            cont_ent = torch.zeros_like(disc_ent)
+        return disc_ent + cont_ent
 
     def sample(self) -> torch.Tensor:
         cat = self._cat()
@@ -430,6 +507,41 @@ class OneMinOHLCPolicy(ActorCriticPolicy):
         cont = a[..., self.n_assets * self.n_disc :].clamp(-1.0, 1.0)
         out = torch.cat([disc, cont], dim=-1)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    def get_distribution(self, observation: torch.Tensor) -> Distribution:
+        """
+        SB3 calls this during rollout collection. We must compute features and
+        pass them to our custom distribution builder.
+        """
+        observation = torch.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
+        features = self.extract_features(observation)
+        latent_pi, _ = self.mlp_extractor(features)
+        return self._get_action_dist_from_latent(latent_pi, features)
+
+    def evaluate_actions(
+        self, observations: torch.Tensor, actions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        SB3 calls this during the PPO update step. Compute features, build the
+        distribution with them, and return (values, log_prob, entropy).
+        """
+        observations = torch.nan_to_num(observations, nan=0.0, posinf=0.0, neginf=0.0)
+        features = self.extract_features(observations)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+
+        dist = self._get_action_dist_from_latent(latent_pi, features)
+        log_prob = dist.log_prob(actions)
+        values = self.value_net(latent_vf)
+
+        # Robust entropy: categorical + continuous (fallback 0 if squashed entropy is None)
+        disc_ent = dist._cat().entropy().sum(dim=1)
+        cont_ent = dist.cont_dist.entropy()
+        if cont_ent is None:
+            cont_ent = torch.zeros_like(disc_ent)
+        entropy = disc_ent + cont_ent
+
+        return values, log_prob, entropy
+
 
     def get_regime_logits(self) -> Optional[torch.Tensor]:
         return getattr(self, "_last_regime_logits", None)

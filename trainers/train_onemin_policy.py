@@ -24,7 +24,7 @@ from models.onemin_policy import (
 )
 
 from config.settings import (
-    HOURLY_CSV_DIR,
+    ONEMIN_CSV_DIR,
     LIVE_FOREX_PAIRS,
     MODELS_DIR,
     SEED,
@@ -65,7 +65,7 @@ def load_broker_meta(json_path: Path) -> Dict[str, Dict]:
 
 def compute_atr(df: pd.DataFrame, n: int = 14, mode: str = "rolling") -> pd.Series:
     """
-    Robust ATR (hourly):
+    Robust ATR (onemin):
     - mode="rolling": SMA ATR with min_periods=n (strict; may yield initial NaNs)
     - mode="wilder" : Wilder ATR via EMA with min_periods=1 (fallback; never empty)
     """
@@ -217,11 +217,11 @@ class EarlyStoppingCallback(EventCallback):
         return True
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Environment (hourly) — fixed indexing + ATR handling
+# Environment (onemin) — fixed indexing + ATR handling
 # ──────────────────────────────────────────────────────────────────────────────
 class OneMinBacktestEnv(gym.Env):
     """
-    Hourly OHLC backtest with:
+    onemin OHLC backtest with:
       - Single open trade per symbol
       - ATR+broker-floor mapped SL/TP from normalized [-1,1]
       - Event-based reward (reward only on close)
@@ -255,9 +255,9 @@ class OneMinBacktestEnv(gym.Env):
         self.data_paths: Dict[str, str] = {}
         self.data_lengths: Dict[str, int] = {}
         for sym in self.symbols:
-            path = os.path.join(csv_dir, f"{sym}_hourly.csv")
+            path = os.path.join(csv_dir, f"{sym}_1min.csv")
             if not os.path.isfile(path):
-                raise FileNotFoundError(f"Hourly CSV not found for '{sym}': {path}")
+                raise FileNotFoundError(f"Onemin CSV not found for '{sym}': {path}")
             with open(path, "r", encoding="utf-8") as f:
                 n_rows = sum(1 for _ in f) - 1
             self.data_paths[sym] = path
@@ -346,7 +346,7 @@ class OneMinBacktestEnv(gym.Env):
                 df = df.reset_index(drop=True)
 
             if len(df) < self.window + 2:
-                raise ValueError(f"[{sym}] Not enough hourly bars after ATR handling (have {len(df)}, need {self.window + 2})")
+                raise ValueError(f"[{sym}] Not enough onemin bars after ATR handling (have {len(df)}, need {self.window + 2})")
 
             self.dfs[sym] = df
             min_len_after_atr = min(min_len_after_atr, len(df))
@@ -358,7 +358,7 @@ class OneMinBacktestEnv(gym.Env):
         self.runtime_max_steps = min(self.max_steps, int(min_len_after_atr) - self.window - 1)
         if self.runtime_max_steps <= 0:
             raise ValueError(
-                f"Not enough aligned hourly bars across symbols after ATR handling "
+                f"Not enough aligned onemin bars across symbols after ATR handling "
                 f"(min_len={min_len_after_atr}, window={self.window})"
             )
 
@@ -616,7 +616,7 @@ class OneMinBacktestEnv(gym.Env):
 def make_onemin_env(rank: int, seed: int, window: int, symbols=None) -> Callable[[], gym.Env]:
     def _init():
         env = OneMinBacktestEnv(
-            csv_dir=HOURLY_CSV_DIR,
+            csv_dir=ONEMIN_CSV_DIR,
             symbols=symbols or LIVE_FOREX_PAIRS,
             window=window,
             max_steps=1000,
