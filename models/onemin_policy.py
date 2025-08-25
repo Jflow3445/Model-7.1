@@ -175,6 +175,8 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         self.cross = CrossAssetAttention(embed_dim, n_heads, dropout)
         self.final_ln = nn.LayerNorm(embed_dim)
         self.final_drop = nn.Dropout(dropout)
+        self.extras_proj = nn.Linear(6, 5)
+        orthogonal_init(self.extras_proj, gain=1.0)
 
         # Keep output projection shape identical for head compatibility
         self.out_proj = nn.Linear(self._features_dim, self._features_dim)
@@ -226,84 +228,70 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
 
         # ── Extras engineered for trend-change sensitivity (5 per asset) ──────
         eps = 1e-6
-        open_  = bars[..., 0]                                             # [B,N,W]
+        open_  = bars[..., 0]   # [B,N,W]
         high_  = bars[..., 1]
         low_   = bars[..., 2]
         close_ = bars[..., 3]
 
-        # 1) mean_logret on CLOSE (trend strength, scale-free)
+        # 0) read the +1 channel (signed holding time) from the obs
+        #    obs has already been reshaped to [B,N,per_asset]
+        signed_hold = obs[:, :, 4 * self.window]                       # [B,N]
+        in_pos  = (signed_hold != 0).float()                           # [B,N] 1=in position, 0=flat
+        side   = torch.sign(signed_hold).clamp(-1, 1)                  # [B,N] -1 short, 0 flat, +1 long
+
+        # 1) mean_logret on CLOSE
         if self.window >= 2:
-            log_ret = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))   # [B,N,W-1]
-            mean_logret = log_ret.mean(dim=2)                                         # [B,N]
+            log_ret = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))  # [B,N,W-1]
+            mean_logret = log_ret.mean(dim=2)                                        # [B,N]
         else:
-            mean_logret = torch.zeros(B, self.n_assets, device=obs.device)
+            mean_logret = torch.zeros_like(in_pos)
 
-        # 2) atr_pct: scale-invariant range signal
-        atr_pct = (high_ - low_).mean(dim=2) / (close_.abs().mean(dim=2) + eps)       # [B,N]
+        # 2) atr_pct
+        atr_pct = (high_ - low_).mean(dim=2) / (close_.abs().mean(dim=2) + eps)      # [B,N]
 
-        # 3) macd_delta (normalized, bounded): captures inflection/acceleration
+        # 3) macd_delta (normalized, bounded)
         def _ema(x: torch.Tensor, span: int) -> torch.Tensor:
-            # x: [B,N,W] -> same shape; in-graph, O(W)
             alpha = 2.0 / (float(span) + 1.0)
-            out = torch.zeros_like(x)
-            out[..., 0] = x[..., 0]
+            out = torch.zeros_like(x); out[..., 0] = x[..., 0]
             for t in range(1, x.size(-1)):
                 out[..., t] = alpha * x[..., t] + (1.0 - alpha) * out[..., t - 1]
             return out
 
         if self.window >= 3:
-            fast = max(2, self.window // 4)
-            slow = max(fast + 1, self.window // 2)
-            ema_fast = _ema(close_, fast)
-            ema_slow = _ema(close_, slow)
-            macd = ema_fast - ema_slow                                      # [B,N,W]
-            atr_norm = ((high_ - low_).clamp(min=eps).mean(dim=2) + eps).unsqueeze(-1)  # [B,N,1]
+            fast = max(2, self.window // 4); slow = max(fast + 1, self.window // 2)
+            ema_fast = _ema(close_, fast); ema_slow = _ema(close_, slow)
+            macd = ema_fast - ema_slow                                             # [B,N,W]
+            atr_norm = ((high_ - low_).clamp(min=eps).mean(dim=2) + eps).unsqueeze(-1)
             macd_norm = macd / atr_norm
-            macd_delta = macd_norm[..., -1] - macd_norm[..., -2]            # [B,N]
-            macd_delta = torch.tanh(macd_delta)                              # bounded [-1,1]
+            macd_delta = torch.tanh(macd_norm[..., -1] - macd_norm[..., -2])       # [B,N]
         else:
-            macd_delta = torch.zeros(B, self.n_assets, device=obs.device)
+            macd_delta = torch.zeros_like(in_pos)
 
-        # 4) ER_now: Kaufman Efficiency Ratio (trend vs noise) over ~W/6
+        # 4) ER_now (Kaufman efficiency ratio)
         def _efficiency_ratio(c: torch.Tensor, period: int) -> torch.Tensor:
             period = min(max(3, period), c.size(-1) - 1)
             if period <= 1:
                 return torch.zeros_like(c[..., 0])
-            end = c[..., -1]
-            start = c[..., -period - 1]
-            num = (end - start).abs()                                       # [B,N]
-            diffs = (c[..., -period:] - c[..., -period - 1:-1]).abs()       # [B,N,period]
+            end = c[..., -1]; start = c[..., -period - 1]
+            num = (end - start).abs()
+            diffs = (c[..., -period:] - c[..., -period - 1:-1]).abs()
             den = diffs.sum(dim=-1) + eps
             return (num / den).clamp(0.0, 1.0)
 
-        ER_now = _efficiency_ratio(close_, max(3, self.window // 6))        # [B,N]
+        ER_now = _efficiency_ratio(close_, max(3, self.window // 6))               # [B,N]
 
-        # 5) rolling_corr vs base asset (asset 0) on returns (divergence/confirmation)
-        if self.window >= 2:
-            base = log_ret[:, 0, :]                                         # [B,W-1]
-            base_c = base - base.mean(dim=1, keepdim=True)
-            base_std = base_c.std(dim=1, unbiased=False) + eps
-            corr_list = []
-            for i in range(self.n_assets):
-                if i == 0:
-                    corr_list.append(torch.ones(B, device=obs.device))
-                else:
-                    r = log_ret[:, i, :]
-                    r_c = r - r.mean(dim=1, keepdim=True)
-                    r_std = r_c.std(dim=1, unbiased=False) + eps
-                    corr_list.append(torch.tanh((base_c * r_c).mean(dim=1) / (base_std * r_std)))
-            rolling_corr = torch.stack(corr_list, dim=1)                     # [B,N]
-        else:
-            rolling_corr = torch.ones(B, self.n_assets, device=obs.device)
+        # Build 6-per-asset raw extras and project to 5
+        extras_6 = torch.stack([
+            mean_logret,   # trend
+            atr_pct,       # scale-free range
+            macd_delta,    # acceleration
+            ER_now,        # trend vs noise
+            in_pos,        # NEW legality hint (in trade?)
+            side           # NEW legality hint (long/short sign)
+        ], dim=-1)                                                                   # [B,N,6]
 
-        # Assemble 5-per-asset extras (order stable)
-        extras = torch.cat([
-            mean_logret,   # 1
-            atr_pct,       # 2
-            macd_delta,    # 3
-            ER_now,        # 4
-            rolling_corr   # 5
-        ], dim=1)  # [B, N*5]
+        extras_5 = self.extras_proj(extras_6)                                        # [B,N,5]
+        extras = extras_5.reshape(B, -1)                                              # [B, N*5]
 
         # Concatenate pooled transformer features with extras
         y_flat = y.reshape(B, -1)                       # [B, N*E]

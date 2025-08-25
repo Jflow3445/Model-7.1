@@ -1,538 +1,812 @@
-# models/onemin_policy.py
+# train_onemin_policy.py
 from __future__ import annotations
-import math
+import os
+import glob
+import random
 import logging
-from typing import Any, Tuple, Optional
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import re
+import json
+from pathlib import Path
+import subprocess
+from typing import List, Dict, Any, Optional, Callable, Tuple
+import numpy as np
+import pandas as pd
+import gymnasium as gym
 from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, EventCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
 
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.type_aliases import Schedule
-from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution
 
-logger = logging.getLogger("OneMinPolicy")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    _ch = logging.StreamHandler()
-    _ch.setLevel(logging.INFO)
-    _fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%Y-%m-%dT%H:%M:%SZ")
-    _ch.setFormatter(_fmt)
-    logger.addHandler(_ch)
+# Policies / extractor (the recurrent policy may or may not exist in your repo)
+from models.onemin_policy import (
+    OneMinOHLCPolicy,
+)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Blocks
-# ──────────────────────────────────────────────────────────────────────────────
-def orthogonal_init(module: nn.Module, gain: float = math.sqrt(2)) -> None:
-    if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-        nn.init.orthogonal_(module.weight, gain)
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0.0)
-    elif isinstance(module, nn.Embedding):
-        nn.init.normal_(module.weight, std=0.02)
-    elif isinstance(module, nn.MultiheadAttention):
-        nn.init.xavier_uniform_(module.in_proj_weight)
-        if module.in_proj_bias is not None:
-            nn.init.constant_(module.in_proj_bias, 0.0)
-        nn.init.xavier_uniform_(module.out_proj.weight)
-        if module.out_proj.bias is not None:
-            nn.init.constant_(module.out_proj.bias, 0.0)
+from config.settings import (
+    ONEMIN_CSV_DIR,
+    LIVE_FOREX_PAIRS,
+    MODELS_DIR,
+    SEED,
+    SLIPPAGE_PER_UNIT,
+    COMMISSION_PER_TRADE,
+    INITIAL_BALANCE,
+    ONEMIN_OBS_WINDOW,
+    BASE_DIR,
+)
+from utils.reward_utils import RewardFunction
 
-def same_pad(kernel_size: int, dilation: int = 1) -> int:
-    return ((kernel_size - 1) // 2) * dilation
-
-class DSConv1d(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int, dilation: int = 1, p: float = 0.0):
-        super().__init__()
-        pad = same_pad(k, dilation)
-        self.dw = nn.Conv1d(in_ch, in_ch, k, padding=pad, dilation=dilation, groups=in_ch, bias=False)
-        self.pw = nn.Conv1d(in_ch, out_ch, 1, bias=False)
-        self.bn = nn.BatchNorm1d(out_ch)
-        self.drop = nn.Dropout(p)
-        orthogonal_init(self.dw, gain=1.0)
-        orthogonal_init(self.pw, gain=1.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dw(x); x = self.pw(x); x = self.bn(x)
-        return self.drop(F.gelu(x))
-
-class SE1d(nn.Module):
-    def __init__(self, ch: int, r: int = 8):
-        super().__init__()
-        self.fc1 = nn.Linear(ch, max(1, ch // r))
-        self.fc2 = nn.Linear(max(1, ch // r), ch)
-        orthogonal_init(self.fc1); orthogonal_init(self.fc2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = x.mean(dim=2)   # [B, C]
-        a = F.gelu(self.fc1(s))
-        a = torch.sigmoid(self.fc2(a))
-        return x * a.unsqueeze(-1)
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim: int, n_heads: int, ff_dim: int, dropout_p: float = 0.1):
-        super().__init__()
-        if embed_dim % n_heads != 0:
-            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by n_heads ({n_heads})")
-        self.attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout_p, batch_first=True)
-        self.ln1 = nn.LayerNorm(embed_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim), nn.GELU(), nn.Dropout(dropout_p),
-            nn.Linear(ff_dim, embed_dim),
-        )
-        self.ln2 = nn.LayerNorm(embed_dim)
-        self.drop = nn.Dropout(dropout_p)
-        orthogonal_init(self.attn); orthogonal_init(self.ff[0]); orthogonal_init(self.ff[-1])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a, _ = self.attn(x, x, x)
-        x = self.ln1(x + self.drop(a))
-        f = self.ff(x)
-        return self.ln2(x + self.drop(f))
-
-class CrossAssetAttention(nn.Module):
-    def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.08):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
-        self.ln = nn.LayerNorm(embed_dim)
-        orthogonal_init(self.attn)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y, _ = self.attn(x, x, x)
-        return self.ln(x + y)
-
-class AttnPool1D(nn.Module):
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        self.q = nn.Parameter(torch.randn(embed_dim))
-        nn.init.normal_(self.q, std=0.02)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q = self.q / (x.size(-1) ** 0.5)
-        w = torch.softmax((x * q).sum(dim=-1, keepdim=True), dim=1)
-        return (w * x).sum(dim=1)
+# Broker stops (floor)
+BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Feature extractor
+# Constants / Logging
 # ──────────────────────────────────────────────────────────────────────────────
-class OneMinFeatureExtractor(BaseFeaturesExtractor):
+LOGS_DIR = os.path.join(MODELS_DIR, "logs")
+ILLEGAL_ACTION_PENALTY = -10
+SEVERE_ILLEGAL_ACTION_PENALTY = -20
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+def _to_float(x):
+    try:
+        return float(x.item())
+    except AttributeError:
+        return float(x)
+
+def load_broker_meta(json_path: Path) -> Dict[str, Dict]:
+    if json_path.exists():
+        with json_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    logging.warning(f"[train_onemin] broker_stops.json not found at {json_path}, using zeros.")
+    return {}
+
+def compute_atr(df: pd.DataFrame, n: int = 14, mode: str = "rolling") -> pd.Series:
     """
-    features_dim = n_assets * (embed_dim + 5)
-    Obs per-asset: [open, high, low, close] * window + [elapsed] (+ optional pos_dir)
+    Robust ATR (onemin):
+    - mode="rolling": SMA ATR with min_periods=n (strict; may yield initial NaNs)
+    - mode="wilder" : Wilder ATR via EMA with min_periods=1 (fallback; never empty)
     """
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    prev_c = c.shift(1)
+
+    tr = pd.concat(
+        [(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()],
+        axis=1
+    ).max(axis=1)
+
+    if mode == "wilder":
+        atr = tr.ewm(alpha=1.0 / float(n), adjust=False, min_periods=1).mean()
+        atr = atr.replace([np.inf, -np.inf], np.nan).bfill().ffill()
+    else:
+        atr = tr.rolling(int(n), min_periods=int(n)).mean()
+        atr = atr.replace([np.inf, -np.inf], np.nan)
+    return atr
+
+def _safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+        df = df.sort_values("time").drop_duplicates(subset="time", keep="last").reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["open", "high", "low", "close"])
+
+def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
+                 is_long: bool, min_stop_price: float, atr_value: float) -> Tuple[float, float]:
+    """
+    Map normalized [-1,1] to price distances using ATR + broker floor.
+    """
+    FLOOR_FRAC_ATR = 0.20  # min fraction of ATR for floors
+    K_SL_ATR = 0.60
+    K_TP_ATR = 1.20
+
+    atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
+    floor_price = max(float(min_stop_price or 0.0), FLOOR_FRAC_ATR * atr_value)
+
+    sl_dist = max(floor_price, (0.5 + abs(sl_norm)) * K_SL_ATR * max(atr_value, 1e-12))
+    tp_dist = max(floor_price, (0.5 + abs(tp_norm)) * K_TP_ATR * max(atr_value, 1e-12))
+
+    if is_long:
+        sl = entry - sl_dist
+        tp = entry + tp_dist
+    else:
+        sl = entry + sl_dist
+        tp = entry - tp_dist
+    return sl, tp
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Callbacks (mirrors onemin style)
+# ──────────────────────────────────────────────────────────────────────────────
+class CheckpointAndRcloneCallback(BaseCallback):
+    """
+    Save checkpoints at exact PPO timesteps (model.num_timesteps)
+    and then push each .zip to the required rclone destination.
+    """
+    def __init__(self, checkpoint_freq: int, ckpt_dir: str,
+                 name_prefix: str = "onemin_policy_ckpt",
+                 rclone_dest: str = "", verbose: int = 1):
+        super().__init__(verbose)
+        self.checkpoint_freq = int(checkpoint_freq)
+        self.ckpt_dir = ckpt_dir
+        self.name_prefix = name_prefix
+        self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
+        if not self.rclone_dest:
+            raise ValueError("rclone_dest is required (or export RCLONE_DEST).")
+
+    def _on_step(self) -> bool:
+        t = int(self.model.num_timesteps)
+        if t % self.checkpoint_freq != 0:
+            return True
+
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        base = f"{self.name_prefix}_{t}_steps"
+        fpath = os.path.join(self.ckpt_dir, base)
+        self.model.save(fpath)
+        fzip = fpath + ".zip"
+        exists = os.path.exists(fzip)
+        print(f"[Checkpoint] wrote {fzip}  exists={exists}")
+
+        # Mandatory push to remote (synchronous; raises on failure)
+        if not exists:
+            raise RuntimeError(f"Checkpoint file missing after save: {fzip}")
+
+        # rclone: copy file into a remote *directory* (e.g., gdrive:Model-7.1/checkpoints_onemin)
+        cmd = [
+            "rclone", "copy", fzip, self.rclone_dest,
+            "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
+        except subprocess.CalledProcessError as e:
+            # If you prefer to continue training even when upload fails, change to `print(...)` only.
+            raise RuntimeError(f"rclone push failed (exit {e.returncode}) for {fzip} -> {self.rclone_dest}") from e
+
+        return True
+
+class SaveBestModelCallback(BaseCallback):
+    def __init__(self, save_path, check_freq, verbose=1):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.check_freq = check_freq
+        self.best_mean_reward = -np.inf
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+
+        results = []
+        for i in range(self.training_env.num_envs):
+            monitor_file = os.path.join(LOGS_DIR, f"onemin_worker_{i}", "monitor.csv")
+            if os.path.exists(monitor_file):
+                df = pd.read_csv(monitor_file, skiprows=1)
+                if "r" in df.columns:
+                    results.extend(df["r"].values[-200:])  # last 200 episodic returns
+
+        if results:
+            mean_reward = float(np.mean(results))
+            if self.verbose:
+                print(f"[SaveBestModel] mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f}")
+            if mean_reward > self.best_mean_reward + 1e-4:
+                self.best_mean_reward = mean_reward
+                self.model.save(self.save_path)
+                if self.verbose:
+                    print(f"[SaveBestModel] New best → saved to {self.save_path}")
+        return True
+
+class _NoOpCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        return True
+
+class EarlyStoppingCallback(EventCallback):
+    """
+    Patience-based early stopping using mean monitor reward (mirrors onemin).
+    """
+    def __init__(self, check_freq: int, patience: int, verbose=1):
+        super().__init__(callback=_NoOpCallback(), verbose=verbose)
+        self.check_freq = check_freq
+        self.patience = patience
+        self.best_mean_reward = -np.inf
+        self.counter = 0
+        self.verbose = verbose
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+
+        results = []
+        for i in range(self.training_env.num_envs):
+            monitor_file = os.path.join(LOGS_DIR, f"onemin_worker_{i}", "monitor.csv")
+            if os.path.exists(monitor_file):
+                df = pd.read_csv(monitor_file, skiprows=1)
+                if "r" in df.columns:
+                    results.extend(df["r"].values[-200:])
+
+        if not results:
+            return True
+
+        mean_reward = float(np.mean(results))
+        if self.verbose:
+            print(
+                f"[EarlyStopping] step={self.num_timesteps} "
+                f"mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f} "
+                f"counter={self.counter}/{self.patience}"
+            )
+
+        if mean_reward > self.best_mean_reward + 1e-4:
+            self.best_mean_reward = mean_reward
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                if self.verbose:
+                    print("[EarlyStopping] Patience exceeded → stopping training.")
+                return False
+        return True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment (onemin) — fixed indexing + ATR handling
+# ──────────────────────────────────────────────────────────────────────────────
+class OneMinBacktestEnv(gym.Env):
+    """
+    onemin OHLC backtest with:
+      - Single open trade per symbol
+      - ATR+broker-floor mapped SL/TP from normalized [-1,1]
+      - Event-based reward (reward only on close)
+      - Illegal-action masking + penalties
+      - RAM-efficient on-demand CSV loading with safe local indexing
+    """
+    metadata = {"render_modes": ["human"]}
+
     def __init__(
         self,
-        observation_space: spaces.Box,
-        n_assets: int,
-        window: int = 48,
-        embed_dim: int = 32,
-        tcn_hidden: int = 32,
-        n_heads: int = 2,
-        n_layers: int = 1,
-        dropout: float = 0.08,
-        **_: Any,
+        csv_dir: str,
+        symbols: List[str],
+        window: int = 24,
+        max_steps: Optional[int] = None,
+        seed: int = SEED,
+        initial_balance: float = INITIAL_BALANCE,
     ):
-        obs_dim = int(observation_space.shape[0])
-        assert obs_dim % n_assets == 0, f"Obs dim {obs_dim} not divisible by n_assets {n_assets}"
-        per_asset = obs_dim // n_assets
-        allowed = {4 * window + 1, 4 * window + 2}
-        assert per_asset in allowed, f"per_asset={per_asset} not in {allowed}"
+        super().__init__()
+        self.window = int(window)
+        self.symbols = list(symbols)
+        self.n_assets = len(self.symbols)
+        self.seed_val = int(seed)
+        self.initial_balance = float(initial_balance)
+        random.seed(self.seed_val)
+        np.random.seed(self.seed_val)
 
-        super().__init__(observation_space, features_dim=n_assets * (embed_dim + 5))
-        self.n_assets = n_assets
-        self.window = window
-        self.per_asset = per_asset
-        self.embed_dim = embed_dim
-        self._features_dim = n_assets * (embed_dim + 5)
+        # Broker meta (min_stop_price per symbol)
+        self.broker_meta = load_broker_meta(BROKER_STOPS_JSON)
 
-        self.in_ln = nn.LayerNorm(4)
-        self.token = nn.Linear(4, embed_dim)
+        # CSV metadata only (read slices on reset)
+        self.data_paths: Dict[str, str] = {}
+        self.data_lengths: Dict[str, int] = {}
+        for sym in self.symbols:
+            path = os.path.join(csv_dir, f"{sym}_1min.csv")
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Onemin CSV not found for '{sym}': {path}")
+            with open(path, "r", encoding="utf-8") as f:
+                n_rows = sum(1 for _ in f) - 1
+            self.data_paths[sym] = path
+            self.data_lengths[sym] = n_rows
 
-        self.tcn1 = DSConv1d(4, tcn_hidden, k=5, dilation=1, p=dropout * 0.5)
-        self.tcn2 = DSConv1d(tcn_hidden, tcn_hidden, k=5, dilation=2, p=dropout * 0.5)
-        self.tcn3 = DSConv1d(tcn_hidden, embed_dim, k=5, dilation=4, p=dropout * 0.5)
-        self.se = SE1d(embed_dim, r=8)
-
-        self.asset_pos = nn.Embedding(n_assets, embed_dim)
-        self.time_pos = nn.Embedding(window, embed_dim)
-
-        self.blocks = nn.Sequential(*[
-            TransformerBlock(embed_dim, n_heads, embed_dim * 4, dropout_p=dropout)
-            for _ in range(n_layers)
-        ])
-        self.time_pool = AttnPool1D(embed_dim)
-        self.cross = CrossAssetAttention(embed_dim, n_heads, dropout)
-        self.final_ln = nn.LayerNorm(embed_dim)
-        self.final_drop = nn.Dropout(dropout)
-
-        self.out_proj = nn.Linear(self._features_dim, self._features_dim)
-
-        self.register_buffer("asset_idx", torch.arange(n_assets))
-        self.register_buffer("time_idx", torch.arange(window))
-
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding, nn.MultiheadAttention)):
-                orthogonal_init(m)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        B = obs.size(0)
-        obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-
-        obs = obs.reshape(B, self.n_assets, self.per_asset)
-        bars = obs[:, :, : 4 * self.window].reshape(B, self.n_assets, self.window, 4)
-
-        tok = self.token(self.in_ln(bars))  # [B,N,W,E]
-
-        x_cnn = bars.permute(0, 1, 3, 2).contiguous()                     # [B,N,4,W]
-        x_cnn = x_cnn.reshape(B * self.n_assets, 4, self.window)
-        x_cnn = self.tcn3(self.tcn2(self.tcn1(x_cnn)))                    # [B*N,E,W]
-        x_cnn = self.se(x_cnn)
-        x_cnn = x_cnn.permute(0, 2, 1).reshape(B, self.n_assets, self.window, self.embed_dim)
-
-        fused = tok + x_cnn
-        a = self.asset_pos(self.asset_idx).view(1, self.n_assets, 1, self.embed_dim)
-        t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
-        fused = fused + a + t
-
-        t_in  = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
-        t_out = self.blocks(t_in)
-        t_out = self.final_ln(t_out)
-        y     = t_out.reshape(B, self.n_assets, self.window, self.embed_dim)
-
-        y = y.reshape(B * self.n_assets, self.window, self.embed_dim)
-        y = self.time_pool(y)                                             # [B*N,E]
-        y = y.reshape(B, self.n_assets, self.embed_dim)
-        y = self.cross(y)
-        y = self.final_drop(y)
-
-        # ── Extras (5 per asset) ──────────────────────────────────────────────
-        eps = 1e-6
-        open_  = bars[..., 0]
-        high_  = bars[..., 1]
-        low_   = bars[..., 2]
-        close_ = bars[..., 3]
-
-        if self.window >= 2:
-            log_ret = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))
-            mean_logret = log_ret.mean(dim=2)
+        self.max_length = min(self.data_lengths.values())
+        if max_steps is None:
+            self.max_steps = min(1000, self.max_length - self.window - 1)
         else:
-            mean_logret = torch.zeros(B, self.n_assets, device=obs.device)
+            self.max_steps = min(int(max_steps), self.max_length - self.window - 1)
+        if self.max_steps <= 0:
+            raise ValueError("max_steps ≤ 0 after clamping")
 
-        atr_pct = (high_ - low_).mean(dim=2) / (close_.abs().mean(dim=2) + eps)
+        # Spaces
+        obs_dim = self.n_assets * (4 * self.window + 1)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (obs_dim,), np.float32)
+        act_dim = self.n_assets * 10  # [one_hot(8), sl_norm, tp_norm] per asset
+        self.action_space = spaces.Box(-1.0, 1.0, (act_dim,), np.float32)
 
-        def _ema(x: torch.Tensor, span: int) -> torch.Tensor:
-            alpha = 2.0 / (float(span) + 1.0)
-            out = torch.zeros_like(x)
-            out[..., 0] = x[..., 0]
-            for t in range(1, x.size(-1)):
-                out[..., t] = alpha * x[..., t] + (1.0 - alpha) * out[..., t - 1]
-            return out
+        # State
+        self.current_step = 0
+        self.start_idx = 0
+        self.balance = self.initial_balance
 
-        if self.window >= 3:
-            fast = max(2, self.window // 4)
-            slow = max(fast + 1, self.window // 2)
-            ema_fast = _ema(close_, fast)
-            ema_slow = _ema(close_, slow)
-            macd = ema_fast - ema_slow
-            atr_norm = ((high_ - low_).clamp(min=eps).mean(dim=2) + eps).unsqueeze(-1)
-            macd_norm = macd / atr_norm
-            macd_delta = macd_norm[..., -1] - macd_norm[..., -2]
-            macd_delta = torch.tanh(macd_delta)
+        self.last_trade_time = np.zeros(self.n_assets, dtype=np.float32)
+        self.open_trades: List[Dict[str, Any]] = []   # one per symbol at most
+        self.closed_trades: List[Dict[str, Any]] = [] # rolling buffer
+
+        self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
+
+        self.reward_fn = RewardFunction(
+            initial_balance=self.initial_balance,
+            slippage_per_unit=SLIPPAGE_PER_UNIT,
+            commission_per_trade=COMMISSION_PER_TRADE,
+        )
+
+        # Local indexing controls (fix)
+        self.cursor: int = 0               # local index within the sliced DataFrame
+        self.runtime_max_steps: int = 0    # per-reset cap after ATR/cleaning across symbols
+
+        self.seed(self.seed_val)
+
+    # Gymnasium API
+    def seed(self, seed: Optional[int] = None):
+        self.seed_val = int(seed) if seed is not None else self.seed_val
+        random.seed(self.seed_val)
+        np.random.seed(self.seed_val)
+        try:
+            self.action_space.seed(self.seed_val)
+            self.observation_space.seed(self.seed_val)
+        except Exception:
+            pass
+        return [self.seed_val]
+
+    def reset(self, *, seed: Optional[int] = None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self.seed(seed)
+
+        low = self.window
+        high = self.max_length - self.max_steps - 1
+        self.start_idx = random.randint(low, high)
+        self.current_step = 0
+
+        # RAM-efficient load of only the needed rows
+        self.dfs.clear()
+        min_len_after_atr = float("inf")
+
+        for sym in self.symbols:
+            path = self.data_paths[sym]
+            needed_rows = self.start_idx + self.max_steps + self.window + 2
+            skip = self.start_idx - self.window if self.start_idx > self.window else 0
+            skiprows = list(range(1, skip + 1)) if skip > 0 else []
+
+            df = pd.read_csv(path, parse_dates=["time"], skiprows=skiprows, nrows=needed_rows - skip)
+            df = _safe_numeric(df)
+
+            # Compute ATR with strict rolling; fallback to Wilder if too short
+            df["atr"] = compute_atr(df, n=14, mode="rolling")
+            tmp = df.dropna(subset=["atr"])
+            if len(tmp) >= self.window + 2:
+                df = tmp.reset_index(drop=True)
+                df["atr"] = df["atr"].clip(lower=1e-12)
+            else:
+                df["atr"] = compute_atr(df, n=14, mode="wilder").clip(lower=1e-12)
+                df = df.reset_index(drop=True)
+
+            if len(df) < self.window + 2:
+                raise ValueError(f"[{sym}] Not enough onemin bars after ATR handling (have {len(df)}, need {self.window + 2})")
+
+            self.dfs[sym] = df
+            min_len_after_atr = min(min_len_after_atr, len(df))
+
+        # We loaded from (start_idx - window), so "start" within local slices == window
+        self.cursor = self.window
+
+        # After cleaning, clamp per-reset max steps by what's truly aligned across symbols
+        self.runtime_max_steps = min(self.max_steps, int(min_len_after_atr) - self.window - 1)
+        if self.runtime_max_steps <= 0:
+            raise ValueError(
+                f"Not enough aligned onemin bars across symbols after ATR handling "
+                f"(min_len={min_len_after_atr}, window={self.window})"
+            )
+
+        self.balance = self.initial_balance
+        self.last_trade_time.fill(0.0)
+        self.open_trades.clear()
+        self.closed_trades.clear()
+        self.reward_fn.reset()
+
+        obs = self._get_observation(self.cursor)
+        return obs.astype(np.float32), {}
+
+    def _get_observation(self, idx: int) -> np.ndarray:
+        obs_parts = []
+        for i, sym in enumerate(self.symbols):
+            df = self.dfs[sym]
+            window_start = idx - self.window
+            slice_df = df.iloc[window_start:idx]
+            opens = slice_df["open"].to_numpy(dtype=np.float32)
+            highs = slice_df["high"].to_numpy(dtype=np.float32)
+            lows = slice_df["low"].to_numpy(dtype=np.float32)
+            closes = slice_df["close"].to_numpy(dtype=np.float32)
+            if any(len(arr) != self.window for arr in (opens, highs, lows, closes)):
+                raise RuntimeError(
+                    f"[{sym}] expected window={self.window} but got "
+                    f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} (idx={idx})"
+                )
+            # Signed holding-time in steps: +k=long, -k=short, 0=flat
+            ot = self._get_open_trade(sym)
+            if ot is None:
+                signed_holding = 0.0
+            else:
+                held = float(self.current_step - ot.get("open_step", self.current_step))
+                signed_holding = held if ot["trade_type"] == "long" else -held
+            extra = np.array([signed_holding], dtype=np.float32)
+
+            obs_parts.append(np.concatenate([opens, highs, lows, closes, extra], axis=0))
+        return np.concatenate(obs_parts, axis=0)
+
+    # Single open trade per symbol
+    def _get_open_trade(self, sym: str) -> Optional[Dict[str, Any]]:
+        for t in self.open_trades:
+            if t["symbol"] == sym:
+                return t
+        return None
+
+    def _mask_illegal_actions(self, i: int, arr: np.ndarray) -> np.ndarray:
+        valid = np.ones(8, dtype=bool)
+        sym = self.symbols[i]
+        ot = self._get_open_trade(sym)
+        if ot is not None:
+            # In a trade -> cannot buy/sell; only close/adjust
+            valid[1] = False
+            valid[2] = False
+            if ot["trade_type"] == "long":
+                valid[4] = False  # can't close short
+            elif ot["trade_type"] == "short":
+                valid[3] = False  # can't close long
         else:
-            macd_delta = torch.zeros(B, self.n_assets, device=obs.device)
+            # Not in trade -> cannot close/adjust/close-all
+            valid[3:8] = False
+        masked = arr.copy()
+        masked[:8] = np.where(valid, arr[:8], -np.inf)
+        return masked
 
-        def _efficiency_ratio(c: torch.Tensor, period: int) -> torch.Tensor:
-            period = min(max(3, period), c.size(-1) - 1)
-            if period <= 1:
-                return torch.zeros_like(c[..., 0])
-            end = c[..., -1]; start = c[..., -period - 1]
-            num = (end - start).abs()
-            diffs = (c[..., -period:] - c[..., -period - 1:-1]).abs()
-            den = diffs.sum(dim=-1) + eps
-            return (num / den).clamp(0.0, 1.0)
+    def step(self, action: np.ndarray):
+        idx = self.cursor
+        next_idx = idx + 1
 
-        ER_now = _efficiency_ratio(close_, max(3, self.window // 6))
+        reward = 0.0
+        info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
+        illegal_penalty_total = 0.0
 
-        if self.window >= 2:
-            base = log_ret[:, 0, :]
-            base_c = base - base.mean(dim=1, keepdim=True)
-            base_std = base_c.std(dim=1, unbiased=False) + eps
-            corr_list = []
-            for i in range(self.n_assets):
-                if i == 0:
-                    corr_list.append(torch.ones(B, device=obs.device))
+        for i, sym in enumerate(self.symbols):
+            df = self.dfs[sym]
+            act = action[i * 10: (i + 1) * 10]
+            raw_head = np.where(np.isfinite(act[:8]), act[:8], -np.inf)
+            orig_action = int(np.argmax(raw_head))
+
+            # Ensure <= 1 open trade per symbol
+            open_for_sym = [t for t in self.open_trades if t["symbol"] == sym]
+            if len(open_for_sym) > 1:
+                logging.error(f"[{sym}] Multiple open trades detected, auto-closing extras.")
+                illegal_penalty_total += SEVERE_ILLEGAL_ACTION_PENALTY
+                for ot in open_for_sym[1:]:
+                    self.closed_trades.append(dict(
+                        **ot,
+                        exit_price=ot["entry_price"],
+                        pnl=0.0,
+                        slippage=_to_float(self.reward_fn.slippage_per_unit),
+                        commission=_to_float(self.reward_fn.commission_per_trade),
+                        close_step=self.current_step,
+                        stop_type="illegal_auto",
+                    ))
+                keep = open_for_sym[0]
+                self.open_trades = [t for t in self.open_trades if t["symbol"] != sym] + [keep]
+
+            masked = self._mask_illegal_actions(i, act)
+            if np.all(np.isneginf(masked[:8])):
+                act_id = 0  # noop
+            else:
+                act_id = int(np.nanargmax(masked[:8]))
+
+            if masked[orig_action] == -np.inf:
+                illegal_penalty_total += ILLEGAL_ACTION_PENALTY
+
+            # Prices
+            next_open = float(df.at[next_idx, "open"])
+            next_close = float(df.at[next_idx, "close"])
+            next_high = float(df.at[next_idx, "high"])
+            next_low = float(df.at[next_idx, "low"])
+            atr_val = float(df.at[idx, "atr"])
+            min_stop_price = float(self.broker_meta.get(sym, {}).get("min_stop_price", 0.0))
+
+            sl_norm = float(act[8])
+            tp_norm = float(act[9])
+
+            trade_executed = False
+            ot = self._get_open_trade(sym)
+
+            # === Actions ===
+            if act_id == 1 and ot is None:  # buy
+                entry = next_open
+                sl_final, tp_final = _scale_sl_tp(
+                    entry=entry,
+                    sl_norm=sl_norm,
+                    tp_norm=tp_norm,
+                    is_long=True,
+                    min_stop_price=min_stop_price,
+                    atr_value=atr_val,
+                )
+                self._open_trade(sym, "long", entry, sl_final, tp_final)
+                trade_executed = True
+
+            elif act_id == 2 and ot is None:  # sell
+                entry = next_open
+                sl_final, tp_final = _scale_sl_tp(
+                    entry=entry,
+                    sl_norm=sl_norm,
+                    tp_norm=tp_norm,
+                    is_long=False,
+                    min_stop_price=min_stop_price,
+                    atr_value=atr_val,
+                )
+                self._open_trade(sym, "short", entry, sl_final, tp_final)
+                trade_executed = True
+
+            elif act_id in (3, 4, 7) and ot is not None:
+                # Manual close at next close
+                if ot["trade_type"] == "long":
+                    pnl = next_close - ot["entry_price"]
                 else:
-                    r = log_ret[:, i, :]
-                    r_c = r - r.mean(dim=1, keepdim=True)
-                    r_std = r_c.std(dim=1, unbiased=False) + eps
-                    corr_list.append(torch.tanh((base_c * r_c).mean(dim=1) / (base_std * r_std)))
-            rolling_corr = torch.stack(corr_list, dim=1)
+                    pnl = ot["entry_price"] - next_close
+                closed = dict(
+                    **ot,
+                    exit_price=next_close,
+                    pnl=pnl,
+                    slippage=_to_float(self.reward_fn.slippage_per_unit),
+                    commission=_to_float(self.reward_fn.commission_per_trade),
+                    close_step=self.current_step,
+                    stop_type="manual",
+                )
+                self.closed_trades.append(closed)
+                self.balance += (closed["pnl"] - closed["slippage"] - closed["commission"])
+                self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
+                info["closed_trades"].append(closed)
+                trade_executed = True
+
+            # === Auto-close by SL/TP using next bar high/low ===
+            if not trade_executed:
+                ot = self._get_open_trade(sym)
+                if ot is not None:
+                    hit = False
+                    if ot["trade_type"] == "long":
+                        if next_low <= ot["stop_loss"]:
+                            pnl = ot["stop_loss"] - ot["entry_price"]
+                            exit_px = ot["stop_loss"]; stop_type = "sl"; hit = True
+                        elif next_high >= ot["take_profit"]:
+                            pnl = ot["take_profit"] - ot["entry_price"]
+                            exit_px = ot["take_profit"]; stop_type = "tp"; hit = True
+                    else:
+                        if next_high >= ot["stop_loss"]:
+                            pnl = ot["entry_price"] - ot["stop_loss"]
+                            exit_px = ot["stop_loss"]; stop_type = "sl"; hit = True
+                        elif next_low <= ot["take_profit"]:
+                            pnl = ot["entry_price"] - ot["take_profit"]
+                            exit_px = ot["take_profit"]; stop_type = "tp"; hit = True
+
+                    if hit:
+                        closed = dict(
+                            **ot,
+                            exit_price=exit_px,
+                            pnl=pnl,
+                            slippage=_to_float(self.reward_fn.slippage_per_unit),
+                            commission=_to_float(self.reward_fn.commission_per_trade),
+                            close_step=self.current_step,
+                            stop_type=stop_type,
+                        )
+                        self.closed_trades.append(closed)
+                        self.balance += (closed["pnl"] - closed["slippage"] - closed["commission"])
+                        self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
+                        info["closed_trades"].append(closed)
+                        trade_executed = True
+
+            self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
+            info["symbols"][sym] = {"executed": trade_executed, "action_id": act_id}
+
+        # === Event-based reward: only when trades close ===
+        global_since_last_trade = float(np.min(self.last_trade_time)) if len(self.last_trade_time) else 0.0
+
+        # add holding_time (in steps) to each open trade for the reward function
+        open_trades_for_reward = []
+        for t in self.open_trades:
+            td = dict(t)
+            td["holding_time"] = self.current_step - td.get("open_step", self.current_step)
+            open_trades_for_reward.append(td)
+
+        # --- compute reward EVERY step (event terms are zero if nothing closed) ---
+        reward = float(self.reward_fn(
+            closed_trades=info["closed_trades"],      # may be []
+            open_trades=open_trades_for_reward,       # includes holding_time
+            account_balance=self.balance,
+            unrealized_pnl=0.0,
+            time_since_last_trade=global_since_last_trade
+        ).item())
+
+        # keep existing illegal-action penalties EXACTLY as-is
+        reward += illegal_penalty_total
+
+        # IMPORTANT: final clip AFTER adding penalties
+        final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
+        reward = float(np.clip(reward, -final_cap, final_cap))
+
+        # Keep only recent closed trades
+        MAX_CLOSED_TRADES = 1000
+        if len(self.closed_trades) > MAX_CLOSED_TRADES:
+            self.closed_trades = self.closed_trades[-MAX_CLOSED_TRADES:]
+
+        self.current_step += 1
+        terminated = self.current_step >= self.runtime_max_steps
+        truncated = False
+
+        if not (terminated or truncated):
+            self.cursor += 1
+            obs = self._get_observation(self.cursor).astype(np.float32)
         else:
-            rolling_corr = torch.ones(B, self.n_assets, device=obs.device)
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
-        extras = torch.cat([mean_logret, atr_pct, macd_delta, ER_now, rolling_corr], dim=1)  # [B, N*5]
+        return obs, float(reward), terminated, truncated, info
 
-        y_flat = y.reshape(B, -1)
-        feats = torch.cat([y_flat, extras], dim=1)      # [B, N*(E + 5)]
-        out = self.out_proj(feats)
-        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-    @property
-    def features_dim(self) -> int:
-        return self._features_dim
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Hybrid distribution
-# ──────────────────────────────────────────────────────────────────────────────
-class HybridActionDistribution(Distribution):
-    def __init__(self, n_assets: int, n_discrete: int = 8, n_cont: int = 2, squash_gaussian: bool = True):
-        super().__init__()
-        self.n_assets = n_assets
-        self.n_discrete = n_discrete
-        self.n_cont = n_cont
-        self.cont_dim = n_assets * n_cont
-        if squash_gaussian:
-            self.cont_dist = SquashedDiagGaussianDistribution(self.cont_dim)
-        else:
-            from stable_baselines3.common.distributions import DiagGaussianDistribution
-            self.cont_dist = DiagGaussianDistribution(self.cont_dim)
-        self._disc_logits: Optional[torch.Tensor] = None
-
-    def proba_distribution(self, discrete_logits: torch.Tensor, cont_mean: torch.Tensor, cont_log_std: torch.Tensor):
-        if discrete_logits.dim() == 2:
-            B = discrete_logits.shape[0]
-            self._disc_logits = discrete_logits.view(B, self.n_assets, self.n_discrete)
-        elif discrete_logits.dim() == 3:
-            self._disc_logits = discrete_logits
-        else:
-            raise ValueError("discrete_logits must be [B, N*8] or [B, N, 8]")
-        self.cont_dist = self.cont_dist.proba_distribution(cont_mean, cont_log_std)
-        return self
-
-    def proba_distribution_net(self, *args, **kwargs):
-        return nn.Identity(), None
-
-    def actions_from_params(self, discrete_logits: torch.Tensor, cont_mean: torch.Tensor, cont_log_std: torch.Tensor, deterministic: bool = False):
-        self.proba_distribution(discrete_logits, cont_mean, cont_log_std)
-        return self.get_actions(deterministic)
-
-    def log_prob_from_params(self, discrete_logits: torch.Tensor, cont_mean: torch.Tensor, cont_log_std: torch.Tensor):
-        self.proba_distribution(discrete_logits, cont_mean, cont_log_std)
-        actions = self.get_actions(deterministic=False)
-        return actions, self.log_prob(actions)
-
-    def _cat(self) -> torch.distributions.Categorical:
-        if self._disc_logits is None:
-            raise RuntimeError("Call proba_distribution first")
-        return torch.distributions.Categorical(logits=self._disc_logits)
-
-    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        B = actions.shape[0]
-        disc = actions[:, : self.n_assets * self.n_discrete].view(B, self.n_assets, self.n_discrete)
-        cont = actions[:, self.n_assets * self.n_discrete :]
-        disc = torch.nan_to_num(disc, nan=0.0).clamp(min=0.0)
-        disc = disc / (disc.sum(dim=2, keepdim=True) + 1e-8)
-        idx = disc.argmax(dim=2)
-        cat_lp = self._cat().log_prob(idx).sum(dim=1)
-        cont_lp = self.cont_dist.log_prob(cont)
-        return cat_lp + cont_lp
-
-    def entropy(self) -> torch.Tensor:
-        disc_ent = self._cat().entropy().sum(dim=1)
-        cont_ent = self.cont_dist.entropy()
-        if cont_ent is None:
-            cont_ent = torch.zeros_like(disc_ent)
-        return disc_ent + cont_ent
-
-    def sample(self) -> torch.Tensor:
-        cat = self._cat()
-        idx = cat.sample()
-        B = idx.size(0)
-        disc_one_hot = F.one_hot(idx, num_classes=self.n_discrete).float().view(B, -1)
-        cont = self.cont_dist.sample()
-        return torch.cat([disc_one_hot, cont], dim=1)
-
-    def mode(self) -> torch.Tensor:
-        logits = self._cat().logits
-        idx = logits.argmax(dim=-1)
-        B = idx.size(0)
-        disc_one_hot = F.one_hot(idx, num_classes=self.n_discrete).float().view(B, -1)
-        cont_mode = self.cont_dist.mode()
-        return torch.cat([disc_one_hot, cont_mode], dim=1)
-
-    def get_actions(self, deterministic: bool = False) -> torch.Tensor:
-        return self.mode() if deterministic else self.sample()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Policy with hard masking
-# ──────────────────────────────────────────────────────────────────────────────
-class OneMinOHLCPolicy(ActorCriticPolicy):
-    """
-    Cat(8) + Squashed Gaussian(2) per asset, with **hard masking** using pos_dir.
-    """
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Space,
-        lr_schedule: Schedule,
-        window: int = 48,
-        embed_dim: int = 32,
-        tcn_hidden: int = 32,
-        n_heads: int = 2,
-        n_layers: int = 1,
-        base_disc_temperature: float = 1.0,
-        state_dependent_std: bool = True,
-        **kwargs: Any,
-    ):
-        act_dim = action_space.shape[0]
-        assert act_dim % 10 == 0, f"Action dim must be 10*n_assets (got {act_dim})"
-        self.n_assets = act_dim // 10
-        self.n_disc = 8
-        self.n_cont = 2
-        self.base_disc_temperature = float(max(0.4, min(2.0, base_disc_temperature)))
-        self.state_dependent_std = bool(state_dependent_std)
-        kwargs.pop("net_arch", None)
-
-        default_policy_kwargs: dict[str, Any] = dict(
-            net_arch=dict(pi=[192, 128], vf=[192, 128]),
-            features_extractor_class=OneMinFeatureExtractor,
-            features_extractor_kwargs=dict(
-                n_assets=self.n_assets,
-                window=window,
-                embed_dim=embed_dim,
-                tcn_hidden=tcn_hidden,
-                n_heads=n_heads,
-                n_layers=n_layers,
-                dropout=0.08,
-            ),
-            squash_output=False,
+    def _open_trade(self, sym: str, direction: str, entry: float, sl: float, tp: float):
+        self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]  # ensure at most one
+        trade = dict(
+            symbol=sym,
+            trade_type=direction,
+            entry_price=float(entry),
+            stop_loss=float(sl),
+            take_profit=float(tp),
+            volume=1.0,
+            open_step=self.current_step,
         )
-        super().__init__(observation_space, action_space, lr_schedule, **{**default_policy_kwargs, **kwargs})
+        self.open_trades.append(trade)
+        # Pay costs upfront
+        cost = _to_float(self.reward_fn.slippage_per_unit) + _to_float(self.reward_fn.commission_per_trade)
+        self.balance -= cost
 
-        self._build(lr_schedule)
+    def render(self, mode="human"):
+        idx = self.cursor
+        prices = {sym: float(self.dfs[sym].at[idx, "close"]) for sym in self.symbols}
+        print(f"Step {self.current_step} | Prices={prices} | OpenTrades={len(self.open_trades)} | Balance={self.balance:.2f}")
 
-        latent_dim_pi = self.mlp_extractor.latent_dim_pi
-        self.latent_ln = nn.LayerNorm(latent_dim_pi)
-        self.pi_disc = nn.Linear(latent_dim_pi, self.n_assets * self.n_disc)
-        self.pi_cont_mean = nn.Linear(latent_dim_pi, self.n_assets * self.n_cont)
+# ──────────────────────────────────────────────────────────────────────────────
+# VecEnv factory
+# ──────────────────────────────────────────────────────────────────────────────
+def make_onemin_env(rank: int, seed: int, window: int, symbols=None) -> Callable[[], gym.Env]:
+    def _init():
+        env = OneMinBacktestEnv(
+            csv_dir=ONEMIN_CSV_DIR,
+            symbols=symbols or LIVE_FOREX_PAIRS,
+            window=window,
+            max_steps=1000,
+            seed=seed + rank,
+        )
+        env.seed(seed + rank)
+        log_dir = os.path.join(LOGS_DIR, f"onemin_worker_{rank}")
+        os.makedirs(log_dir, exist_ok=True)
+        env = Monitor(env, filename=os.path.join(log_dir, "monitor.csv"))
+        return env
+    return _init
 
-        if self.state_dependent_std:
-            self.pi_cont_log_std = nn.Linear(latent_dim_pi, self.n_assets * self.n_cont)
+# ──────────────────────────────────────────────────────────────────────────────
+# Checkpoint helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def get_latest_checkpoint(ckpt_dir: str, last_ckpt_path: str, main_save_path: str) -> Optional[str]:
+    ckpt_files = glob.glob(os.path.join(ckpt_dir, "onemin_policy_ckpt_*_steps.zip"))
+    if ckpt_files:
+        extract_steps = lambda f: int(re.findall(r"ckpt_(\d+)_steps", f)[0])
+        latest_ckpt = max(ckpt_files, key=extract_steps)
+        return latest_ckpt
+    elif os.path.exists(last_ckpt_path):
+        return last_ckpt_path
+    elif os.path.exists(main_save_path):
+        return main_save_path
+    else:
+        return None
+
+def steps_from_ckpt_name(path: str) -> int:
+    m = re.search(r"ckpt_(\d+)_steps", os.path.basename(path))
+    return int(m.group(1)) if m else 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Training (mirrors onemin structure, prefers recurrent)
+# ──────────────────────────────────────────────────────────────────────────────
+def train_onemin_policy(
+    window: int = ONEMIN_OBS_WINDOW,
+    total_timesteps: int = 10_000_000,
+    n_envs: int = 32,
+    checkpoint_freq: int = 10_000,
+    patience: int = 100,
+    early_stopping_check_freq: int = 10_000,
+):
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("train_onemin_policy")
+    logger.info("Starting onemin-term training with PPO and event-based reward.")
+
+    # VecEnv
+    env_fns = [make_onemin_env(i, SEED, window) for i in range(n_envs)]
+    vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
+
+    n_steps = 2048
+    batch_size = 4096
+    assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
+
+    algo_cls = PPO
+    policy_cls = OneMinOHLCPolicy
+    algo_kwargs = dict(
+        n_steps=n_steps,
+        batch_size=batch_size,
+        learning_rate=2e-4,
+        gamma=0.995,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        tensorboard_log=os.path.join(LOGS_DIR, "tb_onemin_policy"),
+        device="cuda",
+    )
+    policy_kwargs = dict(window=window)
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    ckpt_dir = os.path.join(MODELS_DIR, "checkpoints_onemin")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    main_save_path = os.path.join(ckpt_dir, "onemin_policy.zip")
+    last_ckpt_path = os.path.join(ckpt_dir, "onemin_policy_last.zip")
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # rclone destination must be a *directory* on your remote, e.g.:
+    # export RCLONE_DEST="gdrive:Model-7.1/checkpoints_onemin"
+    rclone_dest = os.getenv("RCLONE_DEST")
+
+    checkpoint_callback = CheckpointAndRcloneCallback(
+        checkpoint_freq=checkpoint_freq,       # e.g. 10_000 PPO steps
+        ckpt_dir=ckpt_dir,
+        name_prefix="onemin_policy_ckpt",
+        rclone_dest=rclone_dest,
+    )
+
+    best_model_callback = SaveBestModelCallback(
+        save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
+        check_freq=checkpoint_freq,
+        verbose=1,
+    )
+    early_stopping_callback = EarlyStoppingCallback(
+        check_freq=early_stopping_check_freq,
+        patience=patience,
+        verbose=1,
+    )
+    # Resume logic (unchanged)
+    resume_path = get_latest_checkpoint(ckpt_dir, last_ckpt_path, main_save_path)
+    target_total_timesteps = int(total_timesteps)
+
+    if resume_path:
+        print(f"Resuming from checkpoint: {resume_path}")
+        model = algo_cls.load(resume_path, env=vec_env, device="cuda")
+        already_trained = getattr(model, "num_timesteps", steps_from_ckpt_name(resume_path))
+        print(f"Already trained (model counter): {already_trained} steps")
+        timesteps_left = max(target_total_timesteps - already_trained, 0)
+    else:
+        model = algo_cls(
+            policy=policy_cls,
+            env=vec_env,
+            verbose=1,
+            seed=SEED,
+            policy_kwargs=policy_kwargs,
+            **algo_kwargs,
+        )
+        timesteps_left = target_total_timesteps
+
+    try:
+        if timesteps_left > 0:
+            model.learn(
+                total_timesteps=timesteps_left,
+                callback=[checkpoint_callback, best_model_callback, early_stopping_callback],
+                reset_num_timesteps=False,
+            )
+            model.save(last_ckpt_path)
+            model.save(main_save_path)
+            logger.info(f"Training complete. Model saved to {main_save_path} and {last_ckpt_path}")
         else:
-            self.log_std = nn.Parameter(-0.5 * torch.ones(self.n_assets * self.n_cont))
+            logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")
+    finally:
+        vec_env.close()
 
-        self.temp_head = nn.Linear(self.features_extractor.features_dim, self.n_assets)
-        self.regime_classifier = nn.Linear(self.features_extractor.features_dim, 4)
 
-        for m in [self.pi_disc, self.pi_cont_mean, self.temp_head, self.regime_classifier]:
-            orthogonal_init(m, gain=0.01)
-        if self.state_dependent_std:
-            orthogonal_init(self.pi_cont_log_std, gain=0.01)
-
-        self._hybrid = HybridActionDistribution(self.n_assets, self.n_disc, self.n_cont, squash_gaussian=True)
-
-    def _build_action_mask_from_obs(self, observation: torch.Tensor) -> Optional[torch.Tensor]:
-        """
-        Build [B, N, 8] mask with 0 for valid actions and -BIG for invalid,
-        using per-asset pos_dir (-1 short, 0 flat, +1 long). If pos_dir missing,
-        return None.
-        """
-        BIG = 1e9
-        B = observation.shape[0]
-        per_asset = observation.shape[1] // self.n_assets
-        tail = per_asset - 4 * self.features_extractor.window  # 1=elapsed, 2=elapsed+pos_dir
-        if tail < 2:
-            return None
-        obs_3d = observation.view(B, self.n_assets, per_asset)
-        pos_dir = obs_3d[:, :, -1]  # [-1,0,+1]
-        mask = torch.zeros(B, self.n_assets, self.n_disc, device=observation.device)
-
-        # flat → forbid 3..7 (close/adjust/close-all)
-        flat = (pos_dir == 0)
-        if flat.any():
-            mask[flat] += torch.tensor([0, 0, 0, -BIG, -BIG, -BIG, -BIG, -BIG], device=observation.device)
-
-        # long → forbid buy(1), sell(2), close_short(4)
-        lng = (pos_dir > 0)
-        if lng.any():
-            m = mask[:, :, 1]; m[lng] = -BIG; mask[:, :, 1] = m
-            m = mask[:, :, 2]; m[lng] = -BIG; mask[:, :, 2] = m
-            m = mask[:, :, 4]; m[lng] = -BIG; mask[:, :, 4] = m
-
-        # short → forbid buy(1), sell(2), close_long(3)
-        sht = (pos_dir < 0)
-        if sht.any():
-            m = mask[:, :, 1]; m[sht] = -BIG; mask[:, :, 1] = m
-            m = mask[:, :, 2]; m[sht] = -BIG; mask[:, :, 2] = m
-            m = mask[:, :, 3]; m[sht] = -BIG; mask[:, :, 3] = m
-
-        return mask
-
-    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor, features: torch.Tensor, obs_for_mask: Optional[torch.Tensor] = None) -> Distribution:
-        z = self.latent_ln(latent_pi)
-        disc_logits = self.pi_disc(z)
-        cont_mean   = self.pi_cont_mean(z)
-
-        temps = 0.2 + F.softplus(self.temp_head(features))  # [B,N] >= 0.2
-        temps = temps.unsqueeze(-1).expand(-1, -1, self.n_disc).reshape(disc_logits.size(0), -1)
-        disc_logits = disc_logits / (self.base_disc_temperature * temps.clamp(min=0.2))
-
-        if hasattr(self, "pi_cont_log_std"):
-            cont_log_std = self.pi_cont_log_std(z).clamp(-6.0, 1.5)
-        else:
-            cont_log_std = self.log_std.expand_as(cont_mean).clamp(-6.0, 1.5)
-
-        # Hard mask illegal discrete actions if pos_dir is present
-        if obs_for_mask is not None:
-            mask = self._build_action_mask_from_obs(obs_for_mask)
-            if mask is not None:
-                B = disc_logits.shape[0]
-                disc_logits = disc_logits.view(B, self.n_assets, self.n_disc) + mask
-                disc_logits = disc_logits.view(B, -1)
-
-        return self._hybrid.proba_distribution(disc_logits, cont_mean, cont_log_std)
-
-    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
-        dist = self._get_action_dist_from_latent(latent_pi, features, obs_for_mask=obs)
-        value = self.value_net(latent_vf)
-        actions = dist.get_actions(deterministic=deterministic)
-        log_prob = dist.log_prob(actions)
-        self._last_regime_logits = torch.nan_to_num(self.regime_classifier(features), nan=0.0, posinf=0.0, neginf=0.0)
-        return actions, value, log_prob
-
-    def _predict(self, observation: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        a, _, _ = self.forward(observation, deterministic=deterministic)
-        disc = a[..., : self.n_assets * self.n_disc]
-        cont = a[..., self.n_assets * self.n_disc :].clamp(-1.0, 1.0)
-        out = torch.cat([disc, cont], dim=-1)
-        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def get_distribution(self, observation: torch.Tensor) -> Distribution:
-        observation = torch.nan_to_num(observation, nan=0.0, posinf=0.0, neginf=0.0)
-        features = self.extract_features(observation)
-        latent_pi, _ = self.mlp_extractor(features)
-        return self._get_action_dist_from_latent(latent_pi, features, obs_for_mask=observation)
-
-    def evaluate_actions(self, observations: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        observations = torch.nan_to_num(observations, nan=0.0, posinf=0.0, neginf=0.0)
-        features = self.extract_features(observations)
-        latent_pi, latent_vf = self.mlp_extractor(features)
-        dist = self._get_action_dist_from_latent(latent_pi, features, obs_for_mask=observations)
-        log_prob = dist.log_prob(actions)
-        values = self.value_net(latent_vf)
-        disc_ent = dist._cat().entropy().sum(dim=1)
-        cont_ent = dist.cont_dist.entropy()
-        if cont_ent is None:
-            cont_ent = torch.zeros_like(disc_ent)
-        entropy = disc_ent + cont_ent
-        return values, log_prob, entropy
-
-    def get_regime_logits(self) -> Optional[torch.Tensor]:
-        return getattr(self, "_last_regime_logits", None)
-
-__all__ = ["OneMinFeatureExtractor", "OneMinOHLCPolicy"]
+if __name__ == "__main__":
+    train_onemin_policy()
