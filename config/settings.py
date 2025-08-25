@@ -52,9 +52,9 @@ ENABLE_LONG:   bool = bool(int(_env("ENABLE_LONG",   0)))
 # --------------------------------------------------------------------------- #
 LIVE_TICK_BUFFER:     Final[int]   = int(_env("LIVE_TICK_BUFFER", 10000))
 LIVE_OBS_WINDOW:      Final[int]   = int(_env("LIVE_OBS_WINDOW", 300))
-MEDIUM_OBS_WINDOW:    Final[int]   = int(_env("MEDIUM_OBS_WINDOW", 90))
-LONG_OBS_WINDOW:      Final[int]   = int(_env("LONG_OBS_WINDOW", 90))
-ONEMIN_OBS_WINDOW:    Final[int]   = int(_env("ONEMIN_OBS_WINDOW", 90))
+MEDIUM_OBS_WINDOW:    Final[int]   = int(_env("MEDIUM_OBS_WINDOW", 60))
+LONG_OBS_WINDOW:      Final[int]   = int(_env("LONG_OBS_WINDOW", 60))
+ONEMIN_OBS_WINDOW:    Final[int]   = int(_env("ONEMIN_OBS_WINDOW", 60))
 SIMULATED_TICK_DATA_FREQUENCY: Final[int] = int(_env("SIMULATED_TICK_DATA_FREQUENCY", 60))
 
 # --------------------------------------------------------------------------- #
@@ -93,19 +93,19 @@ TRADE_SIZE_BASE:         Final[int]   = int(_env("TRADE_SIZE_BASE",        100_0
 # --------------------------------------------------------------------------- #
 # Symbols & API Keys                                                          #
 # --------------------------------------------------------------------------- #
-LIVE_FOREX_PAIRS: Final[List[str]] = [
-    "EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDCHF", "NZDUSD",
-    "XAUUSD", "AUDCAD", "AUDUSD", "CADCHF", "CADJPY", "CADSGD",
-    "CHFJPY", "EURAUD", "EURCAD", "EURCHF", "EURJPY", "EURNZD",
-    "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPNZD", "NZDJPY",
-    "XAGEUR", "XAGUSD", "XAUAUD", "XAUEUR", "USDSGD", "USDCZK",
-    "USDHUF", "USDMXN", "USDNOK", "SGDJPY", "AUDNZD", "USDPLN",
-    "USDSEK", "USDCNH", "NZDCAD", "USDTRY", "USDZAR", "ZARJPY",
-    "NZDCHF", "AUDCHF", "EURGBP", "AUDJPY", "CHFSGD", "NZDSGD",
-    "NZDHUF", "EURCNH", "GBPDKK",   
-]
+LIVE_FOREX_PAIRS: Final[List[str]] = ['EURUSD', 'USDJPY', 'GBPUSD', 'USDCAD', 'USDCHF', 
+                                      'NZDUSD', 'XAUUSD', 'AUDCAD', 'AUDUSD', 'CADCHF', 
+                                      'CADJPY', 'CADSGD', 'CHFJPY', 'EURAUD', 'EURCAD', 
+                                      'EURCHF', 'EURJPY', 'EURNZD', 'GBPAUD', 'GBPCAD', 
+                                      'GBPCHF', 'GBPJPY', 'GBPNZD', 'NZDJPY', 'XAGEUR', 
+                                      'XAGUSD', 'XAUAUD', 'XAUEUR', 'USDSGD', 'USDCZK', 
+                                      'USDHUF', 'USDMXN', 'USDNOK', 'SGDJPY', 'AUDNZD', 
+                                      'USDPLN', 'USDSEK', 'USDCNH', 'NZDCAD', 'USDTRY', 
+                                      'USDZAR', 'ZARJPY', 'NZDCHF', 'AUDCHF', 'EURGBP', 
+                                      'AUDJPY', 'CHFSGD', 'NZDSGD', 'NZDHUF', 'EURCNH', 
+                                      'GBPDKK']
 NUM_PAIRS: Final[int] = len(LIVE_FOREX_PAIRS)
-#"SGDJPY" "AUDNZD" "USDPLN" "USDTRY", "USDZAR", add later when enough data
+
 # --------------------------------------------------------------------------- #
 # Observation Space & Features                                                #
 # --------------------------------------------------------------------------- #
