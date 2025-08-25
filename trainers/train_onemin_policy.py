@@ -7,6 +7,7 @@ import logging
 import re
 import json
 from pathlib import Path
+import subprocess
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import numpy as np
 import pandas as pd
@@ -122,45 +123,52 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
 # ──────────────────────────────────────────────────────────────────────────────
 # Callbacks (mirrors onemin style)
 # ──────────────────────────────────────────────────────────────────────────────
-class CheckpointAndRcloneCallback(CheckpointCallback):
-    def __init__(self, *args, models_dir=None, rclone_remote=None, rclone_path=None, async_copy=True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.models_dir = models_dir
-        self.rclone_remote = rclone_remote or os.getenv("RCLONE_REMOTE")
-        self.rclone_path   = rclone_path   or os.getenv("RCLONE_PATH")
-        self.async_copy = async_copy
-
-    def _copy_with_rclone(self, fpath: str):
-        if not (self.rclone_remote and self.rclone_path):
-            return
-        import subprocess, shlex
-        dest = f"{self.rclone_remote}:{self.rclone_path}"
-        cmd = ["rclone", "copy", fpath, dest, "--ignore-existing", "--drive-chunk-size", "64M", "--transfers", "4", "--checkers", "8", "-q"]
-        try:
-            if self.async_copy:
-                subprocess.Popen(cmd)  # don’t block training
-            else:
-                subprocess.run(cmd, check=False)
-        except Exception as e:
-            print(f"[CheckpointAndRcloneCallback] rclone copy failed: {e}")
+class CheckpointAndRcloneCallback(BaseCallback):
+    """
+    Save checkpoints at exact PPO timesteps (model.num_timesteps)
+    and then push each .zip to the required rclone destination.
+    """
+    def __init__(self, checkpoint_freq: int, ckpt_dir: str,
+                 name_prefix: str = "onemin_policy_ckpt",
+                 rclone_dest: str = "", verbose: int = 1):
+        super().__init__(verbose)
+        self.checkpoint_freq = int(checkpoint_freq)
+        self.ckpt_dir = ckpt_dir
+        self.name_prefix = name_prefix
+        self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
+        if not self.rclone_dest:
+            raise ValueError("rclone_dest is required (or export RCLONE_DEST).")
 
     def _on_step(self) -> bool:
-        cont = super()._on_step()  # SB3 may have just saved a file
-        if (self.n_calls % self.save_freq) == 0:
-            # find checkpoint files and push them
-            try:
-                files = sorted(
-                    [f for f in os.listdir(self.save_path) if f.endswith(".zip")],
-                    key=lambda x: os.path.getmtime(os.path.join(self.save_path, x)),
-                    reverse=True,
-                )
-                for f in files[:3]:  # push newest few
-                    fpath = os.path.join(self.save_path, f)
-                    print(f"[Checkpoint] saved: {f} | pushing to remote…")
-                    self._copy_with_rclone(fpath)
-            except Exception as e:
-                print(f"[CheckpointAndRcloneCallback] listing/pushing failed: {e}")
-        return cont
+        t = int(self.model.num_timesteps)
+        if t % self.checkpoint_freq != 0:
+            return True
+
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        base = f"{self.name_prefix}_{t}_steps"
+        fpath = os.path.join(self.ckpt_dir, base)
+        self.model.save(fpath)
+        fzip = fpath + ".zip"
+        exists = os.path.exists(fzip)
+        print(f"[Checkpoint] wrote {fzip}  exists={exists}")
+
+        # Mandatory push to remote (synchronous; raises on failure)
+        if not exists:
+            raise RuntimeError(f"Checkpoint file missing after save: {fzip}")
+
+        # rclone: copy file into a remote *directory* (e.g., gdrive:Model-7.1/checkpoints_onemin)
+        cmd = [
+            "rclone", "copy", fzip, self.rclone_dest,
+            "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
+        except subprocess.CalledProcessError as e:
+            # If you prefer to continue training even when upload fails, change to `print(...)` only.
+            raise RuntimeError(f"rclone push failed (exit {e.returncode}) for {fzip} -> {self.rclone_dest}") from e
+
+        return True
 
 class SaveBestModelCallback(BaseCallback):
     def __init__(self, save_path, check_freq, verbose=1):
@@ -721,6 +729,28 @@ def train_onemin_policy(
     main_save_path = os.path.join(ckpt_dir, "onemin_policy.zip")
     last_ckpt_path = os.path.join(ckpt_dir, "onemin_policy_last.zip")
 
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # rclone destination must be a *directory* on your remote, e.g.:
+    # export RCLONE_DEST="gdrive:Model-7.1/checkpoints_onemin"
+    rclone_dest = os.getenv("RCLONE_DEST")
+
+    checkpoint_callback = CheckpointAndRcloneCallback(
+        checkpoint_freq=checkpoint_freq,       # e.g. 10_000 PPO steps
+        ckpt_dir=ckpt_dir,
+        name_prefix="onemin_policy_ckpt",
+        rclone_dest=rclone_dest,
+    )
+
+    best_model_callback = SaveBestModelCallback(
+        save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
+        check_freq=checkpoint_freq,
+        verbose=1,
+    )
+    early_stopping_callback = EarlyStoppingCallback(
+        check_freq=early_stopping_check_freq,
+        patience=patience,
+        verbose=1,
+    )
     # Resume logic (unchanged)
     resume_path = get_latest_checkpoint(ckpt_dir, last_ckpt_path, main_save_path)
     target_total_timesteps = int(total_timesteps)
@@ -741,25 +771,6 @@ def train_onemin_policy(
             **algo_kwargs,
         )
         timesteps_left = target_total_timesteps
-
-    # Callbacks (keep your existing classes)
-    per_call_freq = max(1, checkpoint_freq // n_envs)
-    checkpoint_callback = CheckpointAndRcloneCallback(
-    save_freq=per_call_freq,
-    save_path=ckpt_dir,
-    name_prefix="onemin_policy_ckpt",
-    models_dir=MODELS_DIR,
-)
-    best_model_callback = SaveBestModelCallback(
-        save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
-        check_freq=checkpoint_freq,
-        verbose=1,
-    )
-    early_stopping_callback = EarlyStoppingCallback(
-        check_freq=early_stopping_check_freq,
-        patience=patience,
-        verbose=1,
-    )
 
     try:
         if timesteps_left > 0:
