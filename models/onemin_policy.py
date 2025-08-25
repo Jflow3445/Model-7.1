@@ -136,11 +136,11 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         observation_space: spaces.Box,
         n_assets: int,
         window: int = 48,        # e.g., 2 days of hourly bars
-        embed_dim: int = 48,
-        tcn_hidden: int = 48,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dropout: float = 0.10,
+        embed_dim: int = 32,
+        tcn_hidden: int = 32,
+        n_heads: int = 2,
+        n_layers: int = 1,
+        dropout: float = 0.08,
         **_: Any,
     ):
         obs_dim = int(observation_space.shape[0])
@@ -211,10 +211,11 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         fused = fused + a + t
 
         # Transformer over flattened time×asset tokens
-        seq = fused.reshape(B, self.n_assets * self.window, self.embed_dim)
-        y = self.blocks(seq)
-        y = self.final_ln(y)
-        y = y.reshape(B, self.n_assets, self.window, self.embed_dim)
+        # cheaper: per-asset transformer over time (L = W)
+        t_in  = fused.reshape(B * self.n_assets, self.window, self.embed_dim)  # [B*N, W, E]
+        t_out = self.blocks(t_in)                                              # L = W ✅
+        t_out = self.final_ln(t_out)
+        y     = t_out.reshape(B, self.n_assets, self.window, self.embed_dim)
 
         # Attention pool over TIME per asset
         y = y.reshape(B * self.n_assets, self.window, self.embed_dim)
@@ -418,10 +419,10 @@ class OneMinOHLCPolicy(ActorCriticPolicy):
         action_space: spaces.Space,
         lr_schedule: Schedule,
         window: int = 48,
-        embed_dim: int = 48,
-        tcn_hidden: int = 48,
-        n_heads: int = 4,
-        n_layers: int = 2,
+        embed_dim: int = 32,
+        tcn_hidden: int = 32,
+        n_heads: int = 2,
+        n_layers: int = 1,
         base_disc_temperature: float = 1.0,
         state_dependent_std: bool = True,
         **kwargs: Any,
@@ -437,7 +438,7 @@ class OneMinOHLCPolicy(ActorCriticPolicy):
 
         default_policy_kwargs: dict[str, Any] = dict(
             # SB3 ≥ 1.8 prefers dict(pi=..., vf=...) instead of [dict(...)]
-            net_arch=dict(pi=[288, 192], vf=[288, 192]),
+            net_arch=dict(pi=[192, 128], vf=[192, 128]),
             features_extractor_class=OneMinFeatureExtractor,
             features_extractor_kwargs=dict(
                 n_assets=self.n_assets,
@@ -446,7 +447,7 @@ class OneMinOHLCPolicy(ActorCriticPolicy):
                 tcn_hidden=tcn_hidden,
                 n_heads=n_heads,
                 n_layers=n_layers,
-                dropout=0.10,
+                dropout=0.08,
             ),
             # IMPORTANT: do not squash unless using gSDE
             squash_output=False,
