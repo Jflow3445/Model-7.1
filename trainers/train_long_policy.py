@@ -386,8 +386,13 @@ class LongBacktestEnv(gym.Env):
                     f"[{sym}] expected window={self.window} but got "
                     f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} (idx={idx})"
                 )
-            elapsed = np.array([self.last_trade_time[i]], dtype=np.float32)
-            obs_parts.append(np.concatenate([opens, highs, lows, closes, elapsed], axis=0))
+            ot = self._get_open_trade(sym)
+            if ot is None:
+                extra = np.array([0.0], dtype=np.float32)
+            else:
+                held = float(self.current_step - ot.get("open_step", self.current_step))
+                extra = np.array([held if ot["trade_type"] == "long" else -held], dtype=np.float32)
+            obs_parts.append(np.concatenate([opens, highs, lows, closes, extra], axis=0))
         return np.concatenate(obs_parts, axis=0)
 
     # Single open trade per symbol
@@ -559,18 +564,29 @@ class LongBacktestEnv(gym.Env):
             info["symbols"][sym] = {"executed": trade_executed, "action_id": act_id}
 
         # === Event-based reward: only when trades close ===
-        if info["closed_trades"]:
-            reward = float(self.reward_fn(
-                closed_trades=info["closed_trades"],
-                open_trades=self.open_trades.copy(),
-                account_balance=self.balance,
-                unrealized_pnl=0.0,
-                time_since_last_trade=0.0,
-            ).item())
-        else:
-            reward = 0.0
+        global_since_last_trade = float(np.min(self.last_trade_time)) if len(self.last_trade_time) else 0.0
 
+        # include holding_time for open trades so C5 works
+        open_trades_for_reward = []
+        for t in self.open_trades:
+            td = dict(t)
+            td["holding_time"] = self.current_step - td.get("open_step", self.current_step)
+            open_trades_for_reward.append(td)
+
+        reward = float(self.reward_fn(
+            closed_trades=info["closed_trades"],      # may be []
+            open_trades=open_trades_for_reward,       # includes holding_time
+            account_balance=self.balance,
+            unrealized_pnl=0.0,
+            time_since_last_trade=global_since_last_trade
+        ).item())
+
+        # keep your existing illegal-action penalties
         reward += illegal_penalty_total
+
+        # final clip AFTER penalties, same as 1-min
+        final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
+        reward = float(np.clip(reward, -final_cap, final_cap))
 
         # Keep only recent closed trades
         MAX_CLOSED_TRADES = 1000
