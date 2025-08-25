@@ -123,18 +123,44 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
 # Callbacks (mirrors onemin style)
 # ──────────────────────────────────────────────────────────────────────────────
 class CheckpointAndRcloneCallback(CheckpointCallback):
-    def __init__(self, *args, models_dir=None, **kwargs):
+    def __init__(self, *args, models_dir=None, rclone_remote=None, rclone_path=None, async_copy=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.models_dir = models_dir
+        self.rclone_remote = rclone_remote or os.getenv("RCLONE_REMOTE")
+        self.rclone_path   = rclone_path   or os.getenv("RCLONE_PATH")
+        self.async_copy = async_copy
+
+    def _copy_with_rclone(self, fpath: str):
+        if not (self.rclone_remote and self.rclone_path):
+            return
+        import subprocess, shlex
+        dest = f"{self.rclone_remote}:{self.rclone_path}"
+        cmd = ["rclone", "copy", fpath, dest, "--ignore-existing", "--drive-chunk-size", "64M", "--transfers", "4", "--checkers", "8", "-q"]
+        try:
+            if self.async_copy:
+                subprocess.Popen(cmd)  # don’t block training
+            else:
+                subprocess.run(cmd, check=False)
+        except Exception as e:
+            print(f"[CheckpointAndRcloneCallback] rclone copy failed: {e}")
 
     def _on_step(self) -> bool:
-        result = super()._on_step()
-        if self.num_timesteps % self.save_freq == 0:
-            print(f"[CheckpointAndRcloneCallback] Saved checkpoint at {self.num_timesteps} steps.")
-            print(f"  Files in {self.save_path}: {os.listdir(self.save_path)}")
-            # If rclone is configured on your machine, you can sync:
-            # os.system(f"rclone copy {self.models_dir} gdrive:models")
-        return result
+        cont = super()._on_step()  # SB3 may have just saved a file
+        if (self.n_calls % self.save_freq) == 0:
+            # find checkpoint files and push them
+            try:
+                files = sorted(
+                    [f for f in os.listdir(self.save_path) if f.endswith(".zip")],
+                    key=lambda x: os.path.getmtime(os.path.join(self.save_path, x)),
+                    reverse=True,
+                )
+                for f in files[:3]:  # push newest few
+                    fpath = os.path.join(self.save_path, f)
+                    print(f"[Checkpoint] saved: {f} | pushing to remote…")
+                    self._copy_with_rclone(fpath)
+            except Exception as e:
+                print(f"[CheckpointAndRcloneCallback] listing/pushing failed: {e}")
+        return cont
 
 class SaveBestModelCallback(BaseCallback):
     def __init__(self, save_path, check_freq, verbose=1):
@@ -717,12 +743,13 @@ def train_onemin_policy(
         timesteps_left = target_total_timesteps
 
     # Callbacks (keep your existing classes)
+    per_call_freq = max(1, checkpoint_freq // n_envs)
     checkpoint_callback = CheckpointAndRcloneCallback(
-        save_freq=checkpoint_freq,
-        save_path=ckpt_dir,
-        name_prefix="onemin_policy_ckpt",
-        models_dir=MODELS_DIR,
-    )
+    save_freq=per_call_freq,
+    save_path=ckpt_dir,
+    name_prefix="onemin_policy_ckpt",
+    models_dir=MODELS_DIR,
+)
     best_model_callback = SaveBestModelCallback(
         save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
         check_freq=checkpoint_freq,
