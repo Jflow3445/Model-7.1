@@ -241,15 +241,22 @@ class RewardFunction(nn.Module):
 
         if closed_trades:
             for t in closed_trades:
-                r = _r_multiple_from_trade(t, self.min_risk, self.r_clip)
+                # Use net PnL for reward if enabled
+                pnl_raw = _safe_float(t.get("pnl", 0.0))
+                fees = _safe_float(t.get("slippage", 0.0)) + _safe_float(t.get("commission", 0.0))
+                pnl_eff = pnl_raw - fees if self.integrate_costs_in_reward else pnl_raw
+
+                # Feed net PnL into the R-multiple computation
+                t_for_r = dict(t)
+                t_for_r["pnl"] = pnl_eff
+                r = _r_multiple_from_trade(t_for_r, self.min_risk, self.r_clip)
                 realized_r_list.append(r)
 
-                pnl = _safe_float(t.get("pnl", 0.0))
-                if pnl > 0:
-                    gross_profit_step += pnl
-                elif pnl < 0:
-                    gross_loss_step += -pnl  # absolute
-
+                # EMA quality also based on effective (net) PnL
+                if pnl_eff > 0:
+                    gross_profit_step += pnl_eff
+                elif pnl_eff < 0:
+                    gross_loss_step += -pnl_eff  # absolute
         realized_R_sum = float(sum(realized_r_list)) if realized_r_list else 0.0
 
         # --- EMA quality in [-1,1] (bounded profit factor proxy) ---

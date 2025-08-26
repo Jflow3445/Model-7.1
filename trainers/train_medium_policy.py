@@ -302,7 +302,8 @@ class MediumBacktestEnv(gym.Env):
             overexposure_weight=0.05,
 
             component_clip=2.0,
-            final_clip=2.5
+            final_clip=2.5,
+            integrate_costs_in_reward=True, 
         )
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
