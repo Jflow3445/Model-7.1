@@ -101,9 +101,9 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     """
     Map normalized [-1,1] to price distances using ATR + broker floor.
     """
-    FLOOR_FRAC_ATR = 0.20  # min fraction of ATR for floors
-    K_SL_ATR = 0.60
-    K_TP_ATR = 1.20
+    FLOOR_FRAC_ATR = 0.40  # min fraction of ATR for floors
+    K_SL_ATR = 0.80
+    K_TP_ATR = 1.60
 
     atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
     floor_price = max(float(min_stop_price or 0.0), FLOOR_FRAC_ATR * atr_value)
@@ -292,8 +292,18 @@ class LongBacktestEnv(gym.Env):
             initial_balance=self.initial_balance,
             slippage_per_unit=SLIPPAGE_PER_UNIT,
             commission_per_trade=COMMISSION_PER_TRADE,
-        )
 
+            inactivity_weight=0.005,
+            inactivity_grace_steps=2,          # ~2 hours grace
+            holding_threshold_steps=6,         # start nudging after 6 hours in trade
+            holding_penalty_per_step=0.005,
+
+            risk_budget_R=2.0,
+            overexposure_weight=0.05,
+
+            component_clip=2.0,
+            final_clip=2.5
+        )
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
         self.runtime_max_steps: int = 0    # per-reset cap after ATR/cleaning across symbols
@@ -453,15 +463,20 @@ class LongBacktestEnv(gym.Env):
                 keep = open_for_sym[0]
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym] + [keep]
 
-            masked = self._mask_illegal_actions(i, act)
-            if np.all(np.isneginf(masked[:8])):
-                act_id = 0  # noop
+            # Execute exactly what the policy sampled; illegal => noop
+            valid = np.ones(8, dtype=bool)
+            ot = self._get_open_trade(sym)
+            if ot is not None:
+                valid[1] = False  # buy
+                valid[2] = False  # sell
+                if ot["trade_type"] == "long":
+                    valid[4] = False  # close short (not applicable)
+                elif ot["trade_type"] == "short":
+                    valid[3] = False  # close long (not applicable)
             else:
-                act_id = int(np.nanargmax(masked[:8]))
+                valid[3:8] = False  # cannot close/adjust when flat
 
-            if masked[orig_action] == -np.inf:
-                illegal_penalty_total += ILLEGAL_ACTION_PENALTY
-
+            act_id = orig_action if valid[orig_action] else 0  # 0 = noop on illegal
             # Prices
             next_open = float(df.at[next_idx, "open"])
             next_close = float(df.at[next_idx, "close"])
@@ -519,7 +534,7 @@ class LongBacktestEnv(gym.Env):
                     stop_type="manual",
                 )
                 self.closed_trades.append(closed)
-                self.balance += (closed["pnl"] - closed["slippage"] - closed["commission"])
+                self.balance += closed["pnl"]
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                 info["closed_trades"].append(closed)
                 trade_executed = True
@@ -555,7 +570,7 @@ class LongBacktestEnv(gym.Env):
                             stop_type=stop_type,
                         )
                         self.closed_trades.append(closed)
-                        self.balance += (closed["pnl"] - closed["slippage"] - closed["commission"])
+                        self.balance += closed["pnl"]
                         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                         info["closed_trades"].append(closed)
                         trade_executed = True

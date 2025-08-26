@@ -101,9 +101,9 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     """
     Map normalized [-1,1] to price distances using ATR + broker floor.
     """
-    FLOOR_FRAC_ATR = 0.20  # min fraction of ATR for floors
-    K_SL_ATR = 0.60
-    K_TP_ATR = 1.20
+    FLOOR_FRAC_ATR = 0.40
+    K_SL_ATR = 0.80
+    K_TP_ATR = 1.60
 
     atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
     floor_price = max(float(min_stop_price or 0.0), FLOOR_FRAC_ATR * atr_value)
@@ -224,7 +224,7 @@ class MediumBacktestEnv(gym.Env):
     Hourly OHLC backtest with:
       - Single open trade per symbol
       - ATR+broker-floor mapped SL/TP from normalized [-1,1]
-      - Event-based reward (reward only on close)
+      - Per-step reward (event terms fire on close; penalties can accrue each step)
       - Illegal-action masking + penalties
       - RAM-efficient on-demand CSV loading with safe local indexing
     """
@@ -292,8 +292,18 @@ class MediumBacktestEnv(gym.Env):
             initial_balance=self.initial_balance,
             slippage_per_unit=SLIPPAGE_PER_UNIT,
             commission_per_trade=COMMISSION_PER_TRADE,
-        )
 
+            inactivity_weight=0.005,
+            inactivity_grace_steps=2,          # ~2 hours grace
+            holding_threshold_steps=6,         # start nudging after 6 hours in trade
+            holding_penalty_per_step=0.005,
+
+            risk_budget_R=2.0,
+            overexposure_weight=0.05,
+
+            component_clip=2.0,
+            final_clip=2.5
+        )
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
         self.runtime_max_steps: int = 0    # per-reset cap after ATR/cleaning across symbols
@@ -453,15 +463,20 @@ class MediumBacktestEnv(gym.Env):
                 keep = open_for_sym[0]
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym] + [keep]
 
-            masked = self._mask_illegal_actions(i, act)
-            if np.all(np.isneginf(masked[:8])):
-                act_id = 0  # noop
+            # Execute exactly what the policy sampled; illegal => noop
+            valid = np.ones(8, dtype=bool)
+            ot = self._get_open_trade(sym)
+            if ot is not None:
+                valid[1] = False  # buy
+                valid[2] = False  # sell
+                if ot["trade_type"] == "long":
+                    valid[4] = False  # close short (not applicable)
+                elif ot["trade_type"] == "short":
+                    valid[3] = False  # close long (not applicable)
             else:
-                act_id = int(np.nanargmax(masked[:8]))
+                valid[3:8] = False  # cannot close/adjust when flat
 
-            if masked[orig_action] == -np.inf:
-                illegal_penalty_total += ILLEGAL_ACTION_PENALTY
-
+            act_id = orig_action if valid[orig_action] else 0  # 0 = noop on illegal
             # Prices
             next_open = float(df.at[next_idx, "open"])
             next_close = float(df.at[next_idx, "close"])
@@ -519,7 +534,7 @@ class MediumBacktestEnv(gym.Env):
                     stop_type="manual",
                 )
                 self.closed_trades.append(closed)
-                self.balance += (closed["pnl"] - closed["slippage"] - closed["commission"])
+                self.balance += closed["pnl"]
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                 info["closed_trades"].append(closed)
                 trade_executed = True
@@ -555,7 +570,7 @@ class MediumBacktestEnv(gym.Env):
                             stop_type=stop_type,
                         )
                         self.closed_trades.append(closed)
-                        self.balance += (closed["pnl"] - closed["slippage"] - closed["commission"])
+                        self.balance += closed["pnl"]
                         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                         info["closed_trades"].append(closed)
                         trade_executed = True
@@ -732,12 +747,19 @@ def train_medium_policy(
         timesteps_left = target_total_timesteps
 
     # Callbacks (keep your existing classes)
-    checkpoint_callback = CheckpointAndRcloneCallback(
-        save_freq=checkpoint_freq,
-        save_path=ckpt_dir,
-        name_prefix="medium_policy_ckpt",
-        models_dir=MODELS_DIR,
-    )
+    # Build callback list (checkpoint only if RCLONE_DEST is set)
+    callbacks = [best_model_callback, early_stopping_callback]
+    if rclone_dest:
+        checkpoint_callback = CheckpointAndRcloneCallback(
+            checkpoint_freq=checkpoint_freq,
+            ckpt_dir=ckpt_dir,
+            name_prefix="medium_policy_ckpt",
+            rclone_dest=rclone_dest,
+        )
+        callbacks.insert(0, checkpoint_callback)
+    else:
+        print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
+
     best_model_callback = SaveBestModelCallback(
         save_path=os.path.join(ckpt_dir, "medium_policy_best.zip"),
         check_freq=checkpoint_freq,
@@ -752,10 +774,10 @@ def train_medium_policy(
     try:
         if timesteps_left > 0:
             model.learn(
-                total_timesteps=timesteps_left,
-                callback=[checkpoint_callback, best_model_callback, early_stopping_callback],
-                reset_num_timesteps=False,
-            )
+            total_timesteps=timesteps_left,
+            callback=callbacks,
+            reset_num_timesteps=False,
+        )
             model.save(last_ckpt_path)
             model.save(main_save_path)
             logger.info(f"Training complete. Model saved to {main_save_path} and {last_ckpt_path}")

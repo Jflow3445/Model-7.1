@@ -123,12 +123,13 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
     """
     Drop-in replacement (keeps features_dim = n_assets * (embed_dim + 5)):
       • DS-TCN + Token Transformer + AttnPool + Cross-asset + SE (unchanged)
-      • Extras redesigned for trend-change sensitivity (still 5 per-asset):
-          1) mean_logret (trend)
-          2) atr_pct     (scale-free range)
-          3) macd_delta  (acceleration, normalized, bounded)
-          4) ER_now      (efficiency ratio: trend vs noise)
-          5) rolling_corr (vs base asset; confirmations/divergences)
+      • Extras redesigned for trend-change sensitivity (6 raw → projected to 5 per-asset):
+          1) mean_logret   (trend)
+          2) atr_pct       (scale-free range)
+          3) macd_delta    (acceleration, normalized, bounded)
+          4) ER_now        (efficiency ratio: trend vs noise)
+          5) in_pos        (are we in a trade?)
+          6) side          (long/short sign)
     Obs per-asset: [open, high, low, close] * window + [elapsed]  (unchanged)
     """
     def __init__(
