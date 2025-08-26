@@ -7,17 +7,16 @@ import logging
 import re
 import json
 from pathlib import Path
-import subprocess
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, EventCallback
+from stable_baselines3.common.callbacks import BaseCallback, EventCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-
+import subprocess
 
 # Policies / extractor (the recurrent policy may or may not exist in your repo)
 from models.onemin_policy import (
@@ -45,6 +44,7 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 # ──────────────────────────────────────────────────────────────────────────────
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -20
+ILLEGAL_ATTEMPT_PENALTY = -0.05
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ def load_broker_meta(json_path: Path) -> Dict[str, Dict]:
 
 def compute_atr(df: pd.DataFrame, n: int = 14, mode: str = "rolling") -> pd.Series:
     """
-    Robust ATR (onemin):
+    Robust ATR (Onemin):
     - mode="rolling": SMA ATR with min_periods=n (strict; may yield initial NaNs)
     - mode="wilder" : Wilder ATR via EMA with min_periods=1 (fallback; never empty)
     """
@@ -101,7 +101,7 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     """
     Map normalized [-1,1] to price distances using ATR + broker floor.
     """
-    FLOOR_FRAC_ATR = 0.40  # min fraction of ATR for floors
+    FLOOR_FRAC_ATR = 0.40
     K_SL_ATR = 0.80
     K_TP_ATR = 1.60
 
@@ -136,7 +136,7 @@ class CheckpointAndRcloneCallback(BaseCallback):
         self.name_prefix = name_prefix
         self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
         if not self.rclone_dest:
-            raise ValueError("rclone_dest is required (or export RCLONE_DEST).")
+            print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
 
     def _on_step(self) -> bool:
         t = int(self.model.num_timesteps)
@@ -151,24 +151,27 @@ class CheckpointAndRcloneCallback(BaseCallback):
         exists = os.path.exists(fzip)
         print(f"[Checkpoint] wrote {fzip}  exists={exists}")
 
-        # Mandatory push to remote (synchronous; raises on failure)
         if not exists:
             raise RuntimeError(f"Checkpoint file missing after save: {fzip}")
 
-        # rclone: copy file into a remote *directory* (e.g., gdrive:Model-7.1/checkpoints_onemin)
-        cmd = [
-            "rclone", "copy", fzip, self.rclone_dest,
-            "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
-        ]
-        try:
-            subprocess.run(cmd, check=True)
-            print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
-        except subprocess.CalledProcessError as e:
-            # If you prefer to continue training even when upload fails, change to `print(...)` only.
-            raise RuntimeError(f"rclone push failed (exit {e.returncode}) for {fzip} -> {self.rclone_dest}") from e
+        # Only push if a remote is configured
+        if self.rclone_dest:
+            cmd = [
+                "rclone", "copy", fzip, self.rclone_dest,
+                "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
+            ]
+            try:
+                subprocess.run(cmd, check=True)
+                print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
+            except subprocess.CalledProcessError as e:
+                # If you prefer to continue training on upload failures, change this to a print().
+                raise RuntimeError(f"rclone push failed (exit {e.returncode}) for {fzip} -> {self.rclone_dest}") from e
+        else:
+            print("[Checkpoint] No RCLONE_DEST set; skipped remote upload.")
 
         return True
 
+    
 class SaveBestModelCallback(BaseCallback):
     def __init__(self, save_path, check_freq, verbose=1):
         super().__init__(verbose)
@@ -254,7 +257,7 @@ class EarlyStoppingCallback(EventCallback):
 # ──────────────────────────────────────────────────────────────────────────────
 class OneMinBacktestEnv(gym.Env):
     """
-    onemin OHLC backtest with:
+    Onemin OHLC backtest with:
       - Single open trade per symbol
       - ATR+broker-floor mapped SL/TP from normalized [-1,1]
       - Per-step reward (event terms fire on close; penalties can accrue each step)
@@ -290,7 +293,7 @@ class OneMinBacktestEnv(gym.Env):
         for sym in self.symbols:
             path = os.path.join(csv_dir, f"{sym}_1min.csv")
             if not os.path.isfile(path):
-                raise FileNotFoundError(f"Onemin CSV not found for '{sym}': {path}")
+                raise FileNotFoundError(f"1min CSV not found for '{sym}': {path}")
             with open(path, "r", encoding="utf-8") as f:
                 n_rows = sum(1 for _ in f) - 1
             self.data_paths[sym] = path
@@ -326,16 +329,17 @@ class OneMinBacktestEnv(gym.Env):
             slippage_per_unit=SLIPPAGE_PER_UNIT,
             commission_per_trade=COMMISSION_PER_TRADE,
 
-            inactivity_weight=0.0,            # don’t force constant trading
-            holding_threshold_steps=60,        # ~1 hour at 1-min bars
-            holding_penalty_per_step=0.002,
+            inactivity_weight=0.005,
+            inactivity_grace_steps=2,          # ~2 hours grace
+            holding_threshold_steps=6,         # start nudging after 6 hours in trade
+            holding_penalty_per_step=0.005,
 
             risk_budget_R=2.0,
             overexposure_weight=0.05,
 
             component_clip=2.0,
             final_clip=2.5,
-            integrate_costs_in_reward=True
+            integrate_costs_in_reward=False, 
         )
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
@@ -401,7 +405,7 @@ class OneMinBacktestEnv(gym.Env):
         self.runtime_max_steps = min(self.max_steps, int(min_len_after_atr) - self.window - 1)
         if self.runtime_max_steps <= 0:
             raise ValueError(
-                f"Not enough aligned onemin bars across symbols after ATR handling "
+                f"Not enough aligned 1min bars across symbols after ATR handling "
                 f"(min_len={min_len_after_atr}, window={self.window})"
             )
 
@@ -429,15 +433,12 @@ class OneMinBacktestEnv(gym.Env):
                     f"[{sym}] expected window={self.window} but got "
                     f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} (idx={idx})"
                 )
-            # Signed holding-time in steps: +k=long, -k=short, 0=flat
             ot = self._get_open_trade(sym)
             if ot is None:
-                signed_holding = 0.0
+                extra = np.array([0.0], dtype=np.float32)
             else:
                 held = float(self.current_step - ot.get("open_step", self.current_step))
-                signed_holding = held if ot["trade_type"] == "long" else -held
-            extra = np.array([signed_holding], dtype=np.float32)
-
+                extra = np.array([held if ot["trade_type"] == "long" else -held], dtype=np.float32)
             obs_parts.append(np.concatenate([opens, highs, lows, closes, extra], axis=0))
         return np.concatenate(obs_parts, axis=0)
 
@@ -453,19 +454,22 @@ class OneMinBacktestEnv(gym.Env):
         sym = self.symbols[i]
         ot = self._get_open_trade(sym)
         if ot is not None:
-            # In a trade -> cannot buy/sell; only close/adjust
-            valid[1] = False
-            valid[2] = False
+            # In a trade -> cannot buy/sell; can close (3/4/7) and adjust (5/6)
+            valid[1] = False  # buy
+            valid[2] = False  # sell
             if ot["trade_type"] == "long":
                 valid[4] = False  # can't close short
             elif ot["trade_type"] == "short":
                 valid[3] = False  # can't close long
+            # 5 (adjust SL) and 6 (adjust TP) remain valid while in a trade
         else:
             # Not in trade -> cannot close/adjust/close-all
             valid[3:8] = False
+
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
         return masked
+
 
     def step(self, action: np.ndarray):
         idx = self.cursor
@@ -474,45 +478,61 @@ class OneMinBacktestEnv(gym.Env):
         reward = 0.0
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
-
         for i, sym in enumerate(self.symbols):
             df = self.dfs[sym]
             act = action[i * 10: (i + 1) * 10]
-            raw_head = np.where(np.isfinite(act[:8]), act[:8], -np.inf)
-            orig_action = int(np.argmax(raw_head))
-
-            # Ensure <= 1 open trade per symbol
+            # Safety net: never allow >1 open trade per symbol.
             open_for_sym = [t for t in self.open_trades if t["symbol"] == sym]
             if len(open_for_sym) > 1:
-                logging.error(f"[{sym}] Multiple open trades detected, auto-closing extras.")
+                logging.error(f"[{sym}] Multiple open trades detected; auto-closing extras.")
                 illegal_penalty_total += SEVERE_ILLEGAL_ACTION_PENALTY
-                for ot in open_for_sym[1:]:
-                    self.closed_trades.append(dict(
-                        **ot,
-                        exit_price=ot["entry_price"],
-                        pnl=0.0,
-                        slippage=_to_float(self.reward_fn.slippage_per_unit),
-                        commission=_to_float(self.reward_fn.commission_per_trade),
-                        close_step=self.current_step,
-                        stop_type="illegal_auto",
-                    ))
+                # Close all but the first at breakeven (costs were charged on open)
+                for extra in open_for_sym[1:]:
+                    closed = {
+                        **extra,
+                        "exit_price": extra["entry_price"],
+                        "pnl": 0.0,
+                        "slippage": _to_float(self.reward_fn.slippage_per_unit),
+                        "commission": _to_float(self.reward_fn.commission_per_trade),
+                        "close_step": self.current_step,
+                        "stop_type": "illegal_auto",
+                    }
+                    self.closed_trades.append(closed)
+                    self.balance += closed["pnl"]
+                    info["closed_trades"].append(closed)
+                # Keep only one
                 keep = open_for_sym[0]
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym] + [keep]
 
-            # Execute exactly what the policy sampled; illegal => noop
+            # (A) What the policy *wanted* to do (before masking) — for penalty accounting
+            raw_head = np.where(np.isfinite(act[:8]), act[:8], -np.inf)
+            orig_action = int(np.argmax(raw_head))
+
+            # (B) Mask invalid heads *before* argmax so sampled==executed (clean credit assignment)
+            masked = self._mask_illegal_actions(i, act)         # sets invalid heads to -inf
+            masked_head = masked[:8]
+            act_id = int(np.argmax(masked_head))
+
+            # (C) Optional: small penalty if the policy's original choice was illegal
+            #      (define the valid mask the same way as the masker does)
             valid = np.ones(8, dtype=bool)
             ot = self._get_open_trade(sym)
             if ot is not None:
                 valid[1] = False  # buy
                 valid[2] = False  # sell
                 if ot["trade_type"] == "long":
-                    valid[4] = False  # close short (not applicable)
+                    valid[4] = False  # can't close short
                 elif ot["trade_type"] == "short":
-                    valid[3] = False  # close long (not applicable)
+                    valid[3] = False  # can't close long
+                # 5 (adjust SL) and 6 (adjust TP) are valid while in a trade
             else:
                 valid[3:8] = False  # cannot close/adjust when flat
 
-            act_id = orig_action if valid[orig_action] else 0  # 0 = noop on illegal
+
+            attempted_illegal = not valid[orig_action]
+            if attempted_illegal:
+                illegal_penalty_total += ILLEGAL_ATTEMPT_PENALTY
+
             # Prices
             next_open = float(df.at[next_idx, "open"])
             next_close = float(df.at[next_idx, "close"])
@@ -574,7 +594,62 @@ class OneMinBacktestEnv(gym.Env):
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                 info["closed_trades"].append(closed)
                 trade_executed = True
+            elif act_id == 5 and ot is not None:
+                # Adjust Stop-Loss using current bar’s next close as reference.
+                ref_price = next_close
+                is_long = (ot["trade_type"] == "long")
 
+                # Use provided sl_norm to build a new SL distance; keep TP as-is.
+                new_sl, _unused = _scale_sl_tp(
+                    entry=ref_price,
+                    sl_norm=sl_norm,
+                    tp_norm=0.0,
+                    is_long=is_long,
+                    min_stop_price=min_stop_price,
+                    atr_value=atr_val,
+                )
+
+                # Enforce sensible ordering & a minimum floor away from price and TP.
+                floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                if is_long:
+                    # SL must stay below price and at least 'floor' away from TP.
+                    new_sl = min(new_sl, ot["take_profit"] - floor_price, ref_price - floor_price)
+                else:
+                    # SL must stay above price and at least 'floor' away from TP.
+                    new_sl = max(new_sl, ot["take_profit"] + floor_price, ref_price + floor_price)
+
+                ot["stop_loss"] = float(new_sl)
+                trade_executed = False
+                info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
+
+            elif act_id == 6 and ot is not None:
+                # Adjust Take-Profit using current bar’s next close as reference.
+                ref_price = next_close
+                is_long = (ot["trade_type"] == "long")
+
+                # Use provided tp_norm to build a new TP distance; keep SL as-is.
+                _unused, new_tp = _scale_sl_tp(
+                    entry=ref_price,
+                    sl_norm=0.0,
+                    tp_norm=tp_norm,
+                    is_long=is_long,
+                    min_stop_price=min_stop_price,
+                    atr_value=atr_val,
+                )
+
+                # Enforce sensible ordering & a minimum floor away from price and SL.
+                floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                if is_long:
+                    # TP must stay above price and at least 'floor' away from SL.
+                    new_tp = max(new_tp, ot["stop_loss"] + floor_price, ref_price + floor_price)
+                else:
+                    # TP must stay below price and at least 'floor' away from SL.
+                    new_tp = min(new_tp, ot["stop_loss"] - floor_price, ref_price - floor_price)
+
+                ot["take_profit"] = float(new_tp)
+                trade_executed = False
+                info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
+  
             # === Auto-close by SL/TP using next bar high/low ===
             if not trade_executed:
                 ot = self._get_open_trade(sym)
@@ -612,19 +687,23 @@ class OneMinBacktestEnv(gym.Env):
                         trade_executed = True
 
             self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
-            info["symbols"][sym] = {"executed": trade_executed, "action_id": act_id}
+            info["symbols"][sym] = {
+                **info["symbols"].get(sym, {}),
+                "executed": trade_executed,
+                "action_id": act_id,
+                "attempted_illegal": bool(attempted_illegal),
+            }
 
         # === Event-based reward: only when trades close ===
         global_since_last_trade = float(np.min(self.last_trade_time)) if len(self.last_trade_time) else 0.0
 
-        # add holding_time (in steps) to each open trade for the reward function
+        # include holding_time for open trades so C5 works
         open_trades_for_reward = []
         for t in self.open_trades:
             td = dict(t)
             td["holding_time"] = self.current_step - td.get("open_step", self.current_step)
             open_trades_for_reward.append(td)
 
-        # --- compute reward EVERY step (event terms are zero if nothing closed) ---
         reward = float(self.reward_fn(
             closed_trades=info["closed_trades"],      # may be []
             open_trades=open_trades_for_reward,       # includes holding_time
@@ -633,13 +712,12 @@ class OneMinBacktestEnv(gym.Env):
             time_since_last_trade=global_since_last_trade
         ).item())
 
-        # keep existing illegal-action penalties EXACTLY as-is
+        # keep your existing illegal-action penalties
         reward += illegal_penalty_total
 
-        # IMPORTANT: final clip AFTER adding penalties
+        # final clip AFTER penalties, same as 1-min
         final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
         reward = float(np.clip(reward, -final_cap, final_cap))
-
         # Keep only recent closed trades
         MAX_CLOSED_TRADES = 1000
         if len(self.closed_trades) > MAX_CLOSED_TRADES:
@@ -723,22 +801,21 @@ def steps_from_ckpt_name(path: str) -> int:
 def train_onemin_policy(
     window: int = ONEMIN_OBS_WINDOW,
     total_timesteps: int = 10_000_000,
-    n_envs: int = 32,
+    n_envs: int = 8,
     checkpoint_freq: int = 10_000,
     patience: int = 100,
     early_stopping_check_freq: int = 10_000,
 ):
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("train_onemin_policy")
-    logger.info("Starting onemin-term training with PPO and per-step reward.")
-
+    logger.info("Starting onemin policy training with PPO and event-based reward.")
 
     # VecEnv
     env_fns = [make_onemin_env(i, SEED, window) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
     n_steps = 2048
-    batch_size = 4096
+    batch_size = 256
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
@@ -764,35 +841,6 @@ def train_onemin_policy(
     main_save_path = os.path.join(ckpt_dir, "onemin_policy.zip")
     last_ckpt_path = os.path.join(ckpt_dir, "onemin_policy_last.zip")
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-    # rclone destination must be a *directory* on your remote, e.g.:
-    # export RCLONE_DEST="gdrive:Model-7.1/checkpoints_onemin"
-    rclone_dest = os.getenv("RCLONE_DEST")
-
-    best_model_callback = SaveBestModelCallback(
-        save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
-        check_freq=checkpoint_freq,
-        verbose=1,
-    )
-    early_stopping_callback = EarlyStoppingCallback(
-        check_freq=early_stopping_check_freq,
-        patience=patience,
-        verbose=1,
-    )
-
-    # Build callback list (checkpoint only if RCLONE_DEST is set)
-    callbacks = [best_model_callback, early_stopping_callback]
-    if rclone_dest:
-        checkpoint_callback = CheckpointAndRcloneCallback(
-            checkpoint_freq=checkpoint_freq,
-            ckpt_dir=ckpt_dir,
-            name_prefix="onemin_policy_ckpt",
-            rclone_dest=rclone_dest,
-        )
-        callbacks.insert(0, checkpoint_callback)
-    else:
-        print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
-
     # Resume logic (unchanged)
     resume_path = get_latest_checkpoint(ckpt_dir, last_ckpt_path, main_save_path)
     target_total_timesteps = int(total_timesteps)
@@ -814,12 +862,39 @@ def train_onemin_policy(
         )
         timesteps_left = target_total_timesteps
 
+    # Callbacks (keep your existing classes)
+    # Build callback list (checkpoint only if RCLONE_DEST is set)
+    rclone_dest = os.getenv("RCLONE_DEST")
+
+    best_model_callback = SaveBestModelCallback(
+        save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
+        check_freq=checkpoint_freq,
+        verbose=1,
+    )
+    early_stopping_callback = EarlyStoppingCallback(
+        check_freq=early_stopping_check_freq,
+        patience=patience,
+        verbose=1,
+    )
+
+    callbacks = [best_model_callback, early_stopping_callback]
+    if rclone_dest:
+        checkpoint_callback = CheckpointAndRcloneCallback(
+            checkpoint_freq=checkpoint_freq,
+            ckpt_dir=ckpt_dir,
+            name_prefix="onemin_policy_ckpt",
+            rclone_dest=rclone_dest,
+        )
+        callbacks.insert(0, checkpoint_callback)
+    else:
+        print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
+    # ── Train & save (same pattern as onemin) ────────────────────────────────
     try:
         if timesteps_left > 0:
             model.learn(
-            total_timesteps=timesteps_left,
-            callback=callbacks,
-            reset_num_timesteps=False,
+                total_timesteps=timesteps_left,
+                callback=callbacks,
+                reset_num_timesteps=False,
             )
             model.save(last_ckpt_path)
             model.save(main_save_path)
@@ -828,7 +903,5 @@ def train_onemin_policy(
             logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")
     finally:
         vec_env.close()
-
-
 if __name__ == "__main__":
     train_onemin_policy()
