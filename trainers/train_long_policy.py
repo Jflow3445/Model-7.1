@@ -43,8 +43,8 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 # Constants / Logging
 # ──────────────────────────────────────────────────────────────────────────────
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
-SEVERE_ILLEGAL_ACTION_PENALTY = -20
-ILLEGAL_ATTEMPT_PENALTY = -0.05
+SEVERE_ILLEGAL_ACTION_PENALTY = -2
+ILLEGAL_ATTEMPT_PENALTY = -0.01
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -324,19 +324,21 @@ class LongBacktestEnv(gym.Env):
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
+        risk_budget = max(6.0, 0.75 * self.n_assets)
+
         self.reward_fn = RewardFunction(
             initial_balance=self.initial_balance,
             slippage_per_unit=SLIPPAGE_PER_UNIT,
             commission_per_trade=COMMISSION_PER_TRADE,
 
-            inactivity_weight=0.005,
-            inactivity_grace_steps=2,          # ~2 hours grace
-            holding_threshold_steps=6,         # start nudging after 6 hours in trade
-            holding_penalty_per_step=0.005,
+            inactivity_weight=0.0010,
+            inactivity_grace_steps=20,          # ~20 days grace
+            holding_threshold_steps=30,         # start nudging after 6 hours in trade
+            holding_penalty_per_step=0.0005,
 
-            risk_budget_R=2.0,
-            overexposure_weight=0.05,
-
+            risk_budget_R=risk_budget,
+            overexposure_weight=0.015,
+            unrealized_weight=0.03,
             component_clip=2.0,
             final_clip=2.5,
             integrate_costs_in_reward=False, 
@@ -800,10 +802,10 @@ def steps_from_ckpt_name(path: str) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 def train_long_policy(
     window: int = LONG_OBS_WINDOW,
-    total_timesteps: int = 10_000_000,
+    total_timesteps: int = 50_000_000,
     n_envs: int = 32,
     checkpoint_freq: int = 10_000,
-    patience: int = 100,
+    patience: int = 500,
     early_stopping_check_freq: int = 10_000,
 ):
     logging.basicConfig(level=logging.INFO)
