@@ -165,7 +165,7 @@ class CheckpointAndRcloneCallback(BaseCallback):
                 print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
             except subprocess.CalledProcessError as e:
                 # If you prefer to continue training on upload failures, change this to a print().
-                raise RuntimeError(f"rclone push failed (exit {e.returncode}) for {fzip} -> {self.rclone_dest}") from e
+                print("[Checkpoint] remote push failed.")
         else:
             print("[Checkpoint] No RCLONE_DEST set; skipped remote upload.")
 
