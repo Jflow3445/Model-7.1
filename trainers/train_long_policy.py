@@ -802,7 +802,7 @@ def steps_from_ckpt_name(path: str) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 def train_long_policy(
     window: int = LONG_OBS_WINDOW,
-    total_timesteps: int = 50_000_000,
+    total_timesteps: int = 10_000_000,
     n_envs: int = 32,
     checkpoint_freq: int = 10_000,
     patience: int = 500,
