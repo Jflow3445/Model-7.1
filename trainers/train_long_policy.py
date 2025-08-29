@@ -871,6 +871,7 @@ def train_long_policy(
     best_model_callback = SaveBestModelCallback(
         save_path=os.path.join(ckpt_dir, "long_policy_best.zip"),
         check_freq=checkpoint_freq,
+        rclone_dest=rclone_dest, 
         verbose=1,
     )
     early_stopping_callback = EarlyStoppingCallback(

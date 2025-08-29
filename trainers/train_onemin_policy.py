@@ -869,6 +869,7 @@ def train_onemin_policy(
     best_model_callback = SaveBestModelCallback(
         save_path=os.path.join(ckpt_dir, "onemin_policy_best.zip"),
         check_freq=checkpoint_freq,
+        rclone_dest=rclone_dest, 
         verbose=1,
     )
     early_stopping_callback = EarlyStoppingCallback(
