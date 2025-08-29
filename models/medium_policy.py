@@ -120,17 +120,6 @@ class AttnPool1D(nn.Module):
 # Medium-term feature extractor (hourly)
 # ──────────────────────────────────────────────────────────────────────────────
 class MediumTermFeatureExtractor(BaseFeaturesExtractor):
-    """
-    Drop-in replacement (keeps features_dim = n_assets * (embed_dim + 5)):
-      • DS-TCN + Token Transformer + AttnPool + Cross-asset + SE (unchanged)
-      • Extras redesigned for trend-change sensitivity (still 5 per-asset):
-          1) mean_logret (trend)
-          2) atr_pct     (scale-free range)
-          3) macd_delta  (acceleration, normalized, bounded)
-          4) ER_now      (efficiency ratio: trend vs noise)
-          5) rolling_corr (vs base asset; confirmations/divergences)
-    Obs per-asset: [open, high, low, close] * window + [elapsed]  (unchanged)
-    """
     def __init__(
         self,
         observation_space: spaces.Box,
@@ -418,11 +407,11 @@ class MediumTermOHLCPolicy(ActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        window: int = 48,
-        embed_dim: int = 48,
-        tcn_hidden: int = 48,
-        n_heads: int = 4,
-        n_layers: int = 2,
+        window: int = 32,
+        embed_dim: int = 32,
+        tcn_hidden: int = 32,
+        n_heads: int = 2,
+        n_layers: int = 1,
         base_disc_temperature: float = 1.0,
         state_dependent_std: bool = True,
         **kwargs: Any,
@@ -439,7 +428,7 @@ class MediumTermOHLCPolicy(ActorCriticPolicy):
 
         default_policy_kwargs: dict[str, Any] = dict(
             # SB3 ≥ 1.8 prefers dict(pi=..., vf=...) instead of [dict(...)]
-            net_arch=dict(pi=[288, 192], vf=[288, 192]),
+            net_arch=dict(pi=[192, 128], vf=[192, 128]),
             features_extractor_class=MediumTermFeatureExtractor,
             features_extractor_kwargs=dict(
                 n_assets=self.n_assets,
@@ -448,7 +437,7 @@ class MediumTermOHLCPolicy(ActorCriticPolicy):
                 tcn_hidden=tcn_hidden,
                 n_heads=n_heads,
                 n_layers=n_layers,
-                dropout=0.10,
+                dropout=0.08,
             ),
             # IMPORTANT: do not squash unless using gSDE
             squash_output=False,

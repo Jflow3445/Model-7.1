@@ -427,11 +427,11 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        window: int = 48,
-        embed_dim: int = 48,
-        tcn_hidden: int = 48,
-        n_heads: int = 4,
-        n_layers: int = 2,
+        window: int = 32,
+        embed_dim: int = 32,
+        tcn_hidden: int = 32,
+        n_heads: int = 2,
+        n_layers: int = 1,
         base_disc_temperature: float = 1.0,
         state_dependent_std: bool = True,
         **kwargs: Any,
@@ -448,7 +448,7 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
 
         default_policy_kwargs: dict[str, Any] = dict(
             # SB3 ≥ 1.8 prefers dict(pi=..., vf=...) instead of [dict(...)]
-            net_arch=dict(pi=[288, 192], vf=[288, 192]),
+            net_arch=dict(pi=[192, 128], vf=[192, 128]),
             features_extractor_class=LongTermFeatureExtractor,
             features_extractor_kwargs=dict(
                 n_assets=self.n_assets,
@@ -457,7 +457,7 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
                 tcn_hidden=tcn_hidden,
                 n_heads=n_heads,
                 n_layers=n_layers,
-                dropout=0.10,
+                dropout=0.08,
             ),
             # IMPORTANT: do not squash unless using gSDE
             squash_output=False,
