@@ -3,12 +3,11 @@ from __future__ import annotations
 import math
 import logging
 from typing import Any, Tuple, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gymnasium import spaces
 
+from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
@@ -200,18 +199,24 @@ class MediumTermFeatureExtractor(BaseFeaturesExtractor):
         t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
         fused = fused + a + t
 
-        # Transformer over flattened time×asset tokens
-        seq = fused.reshape(B, self.n_assets * self.window, self.embed_dim)
-        y = self.blocks(seq)
-        y = self.final_ln(y)
-        y = y.reshape(B, self.n_assets, self.window, self.embed_dim)
+        # Transformer over TIME per asset (memory-safe): L = window, not assets*window
+        seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
+
+        use_amp = torch.cuda.is_available()
+        with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
+            seq = self.blocks(seq)                    # [B*N, W, E]
+
+        seq = self.final_ln(seq)
+        y = seq.reshape(B, self.n_assets, self.window, self.embed_dim)
 
         # Attention pool over TIME per asset
         y = y.reshape(B * self.n_assets, self.window, self.embed_dim)
-        y = self.time_pool(y)                                             # [B*N,E]
+        y = self.time_pool(y)                         # [B*N,E]
         y = y.reshape(B, self.n_assets, self.embed_dim)
-        y = self.cross(y)                                                 # cross-asset
-        y = self.final_drop(y)                                            # [B,N,E]
+
+        # Cross-asset attention (short sequence length = N assets)
+        y = self.cross(y)
+        y = self.final_drop(y)                        # [B,N,E]
 
         # ── Extras: window-level OHLC features (24 -> project to 5 per asset) ────────
         eps = 1e-6

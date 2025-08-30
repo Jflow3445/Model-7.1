@@ -213,19 +213,24 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
         fused = fused + a + t
 
-        # Transformer over flattened time×asset tokens
-        # cheaper: per-asset transformer over time (L = W)
-        t_in  = fused.reshape(B * self.n_assets, self.window, self.embed_dim)  # [B*N, W, E]
-        t_out = self.blocks(t_in)                                              # L = W ✅
-        t_out = self.final_ln(t_out)
-        y     = t_out.reshape(B, self.n_assets, self.window, self.embed_dim)
+        # Transformer over TIME per asset (memory-safe): L = window, not assets*window
+        seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
+
+        use_amp = torch.cuda.is_available()
+        with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
+            seq = self.blocks(seq)                    # [B*N, W, E]
+
+        seq = self.final_ln(seq)
+        y = seq.reshape(B, self.n_assets, self.window, self.embed_dim)
 
         # Attention pool over TIME per asset
         y = y.reshape(B * self.n_assets, self.window, self.embed_dim)
-        y = self.time_pool(y)                                             # [B*N,E]
+        y = self.time_pool(y)                         # [B*N,E]
         y = y.reshape(B, self.n_assets, self.embed_dim)
-        y = self.cross(y)                                                 # cross-asset
-        y = self.final_drop(y)                                            # [B,N,E]
+
+        # Cross-asset attention (short sequence length = N assets)
+        y = self.cross(y)
+        y = self.final_drop(y)                        # [B,N,E]
 
         # ── Extras: window-level OHLC features (24 -> project to 5 per asset) ────────
         eps = 1e-6
