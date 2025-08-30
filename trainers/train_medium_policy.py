@@ -822,7 +822,7 @@ def steps_from_ckpt_name(path: str) -> int:
 def train_medium_policy(
     window: int = MEDIUM_OBS_WINDOW,
     total_timesteps: int = 10_000_000,
-    n_envs: int = 32,
+    n_envs: int = 16,
     checkpoint_freq: int = 10_000,
     patience: int = 500,
     early_stopping_check_freq: int = 10_000,
