@@ -823,7 +823,7 @@ def steps_from_ckpt_name(path: str) -> int:
 def train_onemin_policy(
     window: int = ONEMIN_OBS_WINDOW,
     total_timesteps: int = 10_000_000,
-    n_envs: int = 16,
+    n_envs: int = 8,
     checkpoint_freq: int = 10_000,
     patience: int = 500,
     early_stopping_check_freq: int = 10_000,
@@ -836,8 +836,8 @@ def train_onemin_policy(
     env_fns = [make_onemin_env(i, SEED, window) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
-    n_steps = 768
-    batch_size = 1024
+    n_steps = 1024
+    batch_size = 512
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
