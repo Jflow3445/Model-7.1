@@ -554,13 +554,21 @@ class MediumBacktestEnv(gym.Env):
             if attempted_illegal:
                 illegal_penalty_total += ILLEGAL_ATTEMPT_PENALTY
 
-            # Prices
-            next_open = float(df.at[next_idx, "open"])
+            # Use ONLY information available in the current observation:
+            curr_idx   = idx - 1  # last bar included in the observation slice
+            if curr_idx < 0:
+                curr_idx = 0
+            curr_close = float(df.at[curr_idx, "close"])
+            atr_val    = float(df.at[curr_idx, "atr"])
+
+            # Next bar (orders execute / SL/TP evaluated here)
+            next_open  = float(df.at[next_idx, "open"])
             next_close = float(df.at[next_idx, "close"])
-            next_high = float(df.at[next_idx, "high"])
-            next_low = float(df.at[next_idx, "low"])
-            atr_val = float(df.at[idx, "atr"])
+            next_high  = float(df.at[next_idx, "high"])
+            next_low   = float(df.at[next_idx, "low"])
+
             min_stop_price = float(self.broker_meta.get(sym, {}).get("min_stop_price", 0.0))
+
 
             sl_norm = float(act[8])
             tp_norm = float(act[9])
@@ -596,14 +604,15 @@ class MediumBacktestEnv(gym.Env):
                 trade_executed = True
 
             elif act_id in (3, 4, 7) and ot is not None:
-                # Manual close at next close
+                # Manual close at NEXT OPEN (no future leakage)
+                exit_px = next_open
                 if ot["trade_type"] == "long":
-                    pnl = next_close - ot["entry_price"]
+                    pnl = exit_px - ot["entry_price"]
                 else:
-                    pnl = ot["entry_price"] - next_close
+                    pnl = ot["entry_price"] - exit_px
                 closed = dict(
                     **ot,
-                    exit_price=next_close,
+                    exit_price=exit_px,
                     pnl=pnl,
                     slippage=_to_float(self.reward_fn.slippage_per_unit),
                     commission=_to_float(self.reward_fn.commission_per_trade),
@@ -615,12 +624,11 @@ class MediumBacktestEnv(gym.Env):
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                 info["closed_trades"].append(closed)
                 trade_executed = True
-            elif act_id == 5 and ot is not None:
-                # Adjust Stop-Loss using current bar’s next close as reference.
-                ref_price = next_close
-                is_long = (ot["trade_type"] == "long")
 
-                # Use provided sl_norm to build a new SL distance; keep TP as-is.
+            elif act_id == 5 and ot is not None:
+                # Adjust Stop-Loss using the LAST OBSERVED close as reference (curr_close)
+                ref_price = curr_close
+                is_long = (ot["trade_type"] == "long")
                 new_sl, _unused = _scale_sl_tp(
                     entry=ref_price,
                     sl_norm=sl_norm,
@@ -629,26 +637,19 @@ class MediumBacktestEnv(gym.Env):
                     min_stop_price=min_stop_price,
                     atr_value=atr_val,
                 )
-
-                # Enforce sensible ordering & a minimum floor away from price and TP.
                 floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
                 if is_long:
-                    # SL must stay below price and at least 'floor' away from TP.
                     new_sl = min(new_sl, ot["take_profit"] - floor_price, ref_price - floor_price)
                 else:
-                    # SL must stay above price and at least 'floor' away from TP.
                     new_sl = max(new_sl, ot["take_profit"] + floor_price, ref_price + floor_price)
-
                 ot["stop_loss"] = float(new_sl)
                 trade_executed = False
                 info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
 
             elif act_id == 6 and ot is not None:
-                # Adjust Take-Profit using current bar’s next close as reference.
-                ref_price = next_close
+                # Adjust Take-Profit using the LAST OBSERVED close as reference (curr_close)
+                ref_price = curr_close
                 is_long = (ot["trade_type"] == "long")
-
-                # Use provided tp_norm to build a new TP distance; keep SL as-is.
                 _unused, new_tp = _scale_sl_tp(
                     entry=ref_price,
                     sl_norm=0.0,
@@ -657,19 +658,15 @@ class MediumBacktestEnv(gym.Env):
                     min_stop_price=min_stop_price,
                     atr_value=atr_val,
                 )
-
-                # Enforce sensible ordering & a minimum floor away from price and SL.
                 floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
                 if is_long:
-                    # TP must stay above price and at least 'floor' away from SL.
                     new_tp = max(new_tp, ot["stop_loss"] + floor_price, ref_price + floor_price)
                 else:
-                    # TP must stay below price and at least 'floor' away from SL.
                     new_tp = min(new_tp, ot["stop_loss"] - floor_price, ref_price - floor_price)
-
                 ot["take_profit"] = float(new_tp)
                 trade_executed = False
                 info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
+
   
             # === Auto-close by SL/TP using next bar high/low ===
             if not trade_executed:
