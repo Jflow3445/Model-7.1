@@ -835,8 +835,8 @@ def train_medium_policy(
     env_fns = [make_medium_env(i, SEED, window) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
-    n_steps = 8192
-    batch_size = 4096
+    n_steps = 2048
+    batch_size = 1024
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
