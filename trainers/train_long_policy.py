@@ -403,7 +403,7 @@ class LongBacktestEnv(gym.Env):
             skip = self.start_idx - self.window if self.start_idx > self.window else 0
             skiprows = list(range(1, skip + 1)) if skip > 0 else []
 
-            df = pd.read_csv(path, parse_dates=["time"], skiprows=skiprows, nrows=needed_rows - skip)
+            df = pd.read_csv(path, parse_dates=["time"], date_format="ISO8601", skiprows=skiprows, nrows=needed_rows - skip)
             df = _safe_numeric(df)
 
             # Compute ATR with strict rolling; fallback to Wilder if too short
