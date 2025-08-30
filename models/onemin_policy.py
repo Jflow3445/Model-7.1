@@ -136,7 +136,7 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         self,
         observation_space: spaces.Box,
         n_assets: int,
-        window: int = 48,        # e.g., 2 days of hourly bars
+        window: int = 48,  
         embed_dim: int = 32,
         tcn_hidden: int = 32,
         n_heads: int = 2,
@@ -176,7 +176,7 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         self.cross = CrossAssetAttention(embed_dim, n_heads, dropout)
         self.final_ln = nn.LayerNorm(embed_dim)
         self.final_drop = nn.Dropout(dropout)
-        self.extras_proj = nn.Linear(6, 5)
+        self.extras_proj = nn.Linear(24, 5)
         orthogonal_init(self.extras_proj, gain=1.0)
 
         # Keep output projection shape identical for head compatibility
@@ -227,72 +227,96 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         y = self.cross(y)                                                 # cross-asset
         y = self.final_drop(y)                                            # [B,N,E]
 
-        # ── Extras engineered for trend-change sensitivity (5 per asset) ──────
+        # ── Extras: window-level OHLC features (24 -> project to 5 per asset) ────────
         eps = 1e-6
-        open_  = bars[..., 0]   # [B,N,W]
+        open_  = bars[..., 0]     # [B,N,W]
         high_  = bars[..., 1]
         low_   = bars[..., 2]
         close_ = bars[..., 3]
 
-        # 0) read the +1 channel (signed holding time) from the obs
-        #    obs has already been reshaped to [B,N,per_asset]
-        signed_hold = obs[:, :, 4 * self.window]                       # [B,N]
-        in_pos  = (signed_hold != 0).float()                           # [B,N] 1=in position, 0=flat
-        side   = torch.sign(signed_hold).clamp(-1, 1)                  # [B,N] -1 short, 0 flat, +1 long
+        # Current and previous bars
+        o_t, h_t, l_t, c_t = open_[..., -1], high_[..., -1], low_[..., -1], close_[..., -1]
+        o_p, h_p, l_p, c_p = open_[..., -2], high_[..., -2], low_[..., -2], close_[..., -2]
 
-        # 1) mean_logret on CLOSE
-        if self.window >= 2:
-            log_ret = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))  # [B,N,W-1]
-            mean_logret = log_ret.mean(dim=2)                                        # [B,N]
+        # Sequences
+        r_seq = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))     # [B,N,W-1]
+        R_seq = (high_ - low_).abs()                                             # [B,N,W]
+        R_t   = (h_t - l_t).abs()
+        R_p   = (h_p - l_p).abs().clamp_min(eps)
+        denp  = c_p.abs().clamp_min(eps)
+
+        # Last-bar / bar-on-bar (6)
+        logret1     = torch.log((c_t + eps) / (c_p + eps))
+        gap_pct     = (o_t - c_p) / denp
+        range_rel   = R_t / denp
+        body_frac   = ((c_t - o_t) / (R_t + eps)).clamp(-1.0, 1.0)
+        up_wick     = (h_t - torch.maximum(o_t, c_t)) / (R_t + eps)
+        dn_wick     = (torch.minimum(o_t, c_t) - l_t) / (R_t + eps)
+        wick_imb    = (up_wick - dn_wick).clamp(-1.0, 1.0)
+        up_break    = F.relu(h_t - h_p) / R_p
+        dn_break    = F.relu(l_p - l_t) / R_p
+        break_score = torch.tanh(up_break - dn_break)
+
+        # Window direction/vol shape (8)
+        up_ratio    = (r_seq > 0).float().mean(dim=-1) * 2.0 - 1.0
+        s           = torch.sign(r_seq)
+        persistence = (s[..., 1:] * s[..., :-1]).mean(dim=-1)                      # [-1,1]
+        ret_std     = torch.tanh(r_seq.std(dim=-1))
+        r_mean      = r_seq.mean(dim=-1, keepdim=True)
+        r_std       = r_seq.std(dim=-1, keepdim=True).clamp_min(eps)
+        z           = (r_seq - r_mean) / r_std
+        ret_skew    = torch.tanh((z**3).mean(dim=-1))
+        ret_kurt    = torch.tanh((z**4).mean(dim=-1) - 3.0)
+        r_med       = r_seq.median(dim=-1, keepdim=True).values
+        mad         = (r_seq - r_med).abs().median(dim=-1).values.clamp_min(eps)
+        last_ret_z  = torch.tanh((r_seq[..., -1] - r_med.squeeze(-1)) / mad)
+        R_med       = R_seq.median(dim=-1).values.clamp_min(eps)
+        range_ratio_win = torch.tanh(R_t / R_med)
+        W = close_.size(-1)
+        half = W // 2
+        # safe halves (works even if W is small, though your default W=48)
+        if half < 1:
+            range_trend = torch.zeros_like(range_ratio_win)
         else:
-            mean_logret = torch.zeros_like(in_pos)
+            range_trend = torch.tanh((R_seq[..., half:].mean(dim=-1) - R_seq[..., :half].mean(dim=-1)) / (R_med))
 
-        # 2) atr_pct
-        atr_pct = (high_ - low_).mean(dim=2) / (close_.abs().mean(dim=2) + eps)      # [B,N]
+        # Geometry across window (6)
+        body_seq        = ((close_ - open_) / (R_seq + eps)).clamp(-1.0, 1.0)
+        body_frac_delta = (body_frac - body_seq.median(dim=-1).values).clamp(-1.0, 1.0)
+        up_w_seq        = (high_ - torch.maximum(open_, close_)) / (R_seq + eps)
+        dn_w_seq        = (torch.minimum(open_, close_) - low_) / (R_seq + eps)
+        wi_seq          = (up_w_seq - dn_w_seq).clamp(-1.0, 1.0)
+        wick_imb_delta  = (wick_imb - wi_seq.median(dim=-1).values).clamp(-1.0, 1.0)
+        inside_rate     = ((high_[..., 1:] <= high_[..., :-1]) & (low_[..., 1:] >= low_[..., :-1])).float().mean(dim=-1)
+        outside_rate    = ((high_[..., 1:] >  high_[..., :-1]) & (low_[..., 1:] <  low_[..., :-1])).float().mean(dim=-1)
+        c_min = close_.amin(dim=-1); c_max = close_.amax(dim=-1)
+        close_pos_win   = ((c_t - c_min) / ((c_max - c_min).clamp_min(eps)) * 2.0 - 1.0).clamp(-1.0, 1.0)
 
-        # 3) macd_delta (normalized, bounded)
-        def _ema(x: torch.Tensor, span: int) -> torch.Tensor:
-            alpha = 2.0 / (float(span) + 1.0)
-            out = torch.zeros_like(x); out[..., 0] = x[..., 0]
-            for t in range(1, x.size(-1)):
-                out[..., t] = alpha * x[..., t] + (1.0 - alpha) * out[..., t - 1]
-            return out
-
-        if self.window >= 3:
-            fast = max(2, self.window // 4); slow = max(fast + 1, self.window // 2)
-            ema_fast = _ema(close_, fast); ema_slow = _ema(close_, slow)
-            macd = ema_fast - ema_slow                                             # [B,N,W]
-            atr_norm = ((high_ - low_).clamp(min=eps).mean(dim=2) + eps).unsqueeze(-1)
-            macd_norm = macd / atr_norm
-            macd_delta = torch.tanh(macd_norm[..., -1] - macd_norm[..., -2])       # [B,N]
+        # drift shift across halves (safe for small W)
+        if W < 4:
+            ret_drift_shift = torch.zeros_like(close_pos_win)
         else:
-            macd_delta = torch.zeros_like(in_pos)
+            ret_drift_shift = torch.tanh(r_seq[..., half-1:].mean(dim=-1) - r_seq[..., :half-1].mean(dim=-1))
 
-        # 4) ER_now (Kaufman efficiency ratio)
-        def _efficiency_ratio(c: torch.Tensor, period: int) -> torch.Tensor:
-            period = min(max(3, period), c.size(-1) - 1)
-            if period <= 1:
-                return torch.zeros_like(c[..., 0])
-            end = c[..., -1]; start = c[..., -period - 1]
-            num = (end - start).abs()
-            diffs = (c[..., -period:] - c[..., -period - 1:-1]).abs()
-            den = diffs.sum(dim=-1) + eps
-            return (num / den).clamp(0.0, 1.0)
+        # Recency vs extremes (4)
+        idx_high = torch.argmax(high_, dim=-1).to(dtype=close_.dtype)
+        idx_low  = torch.argmin(low_ , dim=-1).to(dtype=close_.dtype)
+        den_idx  = float(max(W - 1, 1))
+        bars_since_high = 2.0 * ((W - 1.0 - idx_high) / den_idx) - 1.0
+        bars_since_low  = 2.0 * ((W - 1.0 - idx_low ) / den_idx) - 1.0
+        close_pos_prev  = ((c_t - l_p) / (R_p + eps) * 2.0 - 1.0).clamp(-1.0, 1.0)
+        open_pos_prev   = ((o_t - l_p) / (R_p + eps) * 2.0 - 1.0).clamp(-1.0, 1.0)
 
-        ER_now = _efficiency_ratio(close_, max(3, self.window // 6))               # [B,N]
+        extras_24 = torch.stack([
+            logret1, gap_pct, range_rel, body_frac, wick_imb, break_score,
+            up_ratio, persistence, ret_std, ret_skew, ret_kurt, last_ret_z, range_ratio_win, range_trend,
+            body_frac_delta, wick_imb_delta, inside_rate, outside_rate, close_pos_win, ret_drift_shift,
+            bars_since_high, bars_since_low, close_pos_prev, open_pos_prev
+        ], dim=-1)   # [B,N,24]
 
-        # Build 6-per-asset raw extras and project to 5
-        extras_6 = torch.stack([
-            mean_logret,   # trend
-            atr_pct,       # scale-free range
-            macd_delta,    # acceleration
-            ER_now,        # trend vs noise
-            in_pos,        # NEW legality hint (in trade?)
-            side           # NEW legality hint (long/short sign)
-        ], dim=-1)                                                                   # [B,N,6]
+        extras_5 = self.extras_proj(extras_24)      # [B,N,5]
+        extras   = extras_5.reshape(B, -1)          # [B, N*5]
 
-        extras_5 = self.extras_proj(extras_6)                                        # [B,N,5]
-        extras = extras_5.reshape(B, -1)                                              # [B, N*5]
 
         # Concatenate pooled transformer features with extras
         y_flat = y.reshape(B, -1)                       # [B, N*E]

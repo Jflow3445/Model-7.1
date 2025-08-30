@@ -173,11 +173,13 @@ class CheckpointAndRcloneCallback(BaseCallback):
 
     
 class SaveBestModelCallback(BaseCallback):
-    def __init__(self, save_path, check_freq, verbose=1):
+    def __init__(self, save_path, check_freq, rclone_dest: str = "", verbose=1):
         super().__init__(verbose)
-        self.save_path = save_path
+        self.save_path = save_path                  # can be with or without ".zip"
         self.check_freq = check_freq
         self.best_mean_reward = -np.inf
+        # allow passing via arg or env; empty means "don’t upload"
+        self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
 
     def _on_step(self) -> bool:
         if self.n_calls % self.check_freq != 0:
@@ -191,15 +193,35 @@ class SaveBestModelCallback(BaseCallback):
                 if "r" in df.columns:
                     results.extend(df["r"].values[-200:])  # last 200 episodic returns
 
-        if results:
-            mean_reward = float(np.mean(results))
+        if not results:
+            return True
+
+        mean_reward = float(np.mean(results))
+        if self.verbose:
+            print(f"[SaveBestModel] mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f}")
+
+        if mean_reward > self.best_mean_reward + 1e-4:
+            self.best_mean_reward = mean_reward
+            # save
+            self.model.save(self.save_path)
+            fzip = self.save_path if self.save_path.endswith(".zip") else (self.save_path + ".zip")
             if self.verbose:
-                print(f"[SaveBestModel] mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f}")
-            if mean_reward > self.best_mean_reward + 1e-4:
-                self.best_mean_reward = mean_reward
-                self.model.save(self.save_path)
-                if self.verbose:
-                    print(f"[SaveBestModel] New best → saved to {self.save_path}")
+                print(f"[SaveBestModel] New best → saved to {fzip}")
+
+            # optional upload
+            if self.rclone_dest:
+                try:
+                    cmd = [
+                        "rclone", "copy", fzip, self.rclone_dest,
+                        "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
+                    ]
+                    subprocess.run(cmd, check=True)
+                    if self.verbose:
+                        print(f"[SaveBestModel] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
+                except FileNotFoundError:
+                    print("[SaveBestModel] rclone not found on PATH; skipped upload.")
+                except subprocess.CalledProcessError as e:
+                    print(f"[SaveBestModel] Upload failed: {e}. Training continues.")
         return True
 
 class _NoOpCallback(BaseCallback):
