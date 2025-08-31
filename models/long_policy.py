@@ -12,6 +12,10 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution
+try:
+    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+except Exception:
+    pass
 
 logger = logging.getLogger("LongPolicy")
 logger.setLevel(logging.INFO)
@@ -113,27 +117,27 @@ class TransformerBlock(nn.Module):
         orthogonal_init(self.attn); orthogonal_init(self.ff[0]); orthogonal_init(self.ff[-1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype_in = x.dtype
+        dtype_in = x.dtype  # typically bfloat16 under AMP
 
-        # MHA in fp32
-        with torch.cuda.amp.autocast(enabled=False):
-            a, _ = self.attn(x.float(), x.float(), x.float())
-        x = x + self.drop(a.to(dtype_in))
+        # ── MultiheadAttention under current AMP (bf16) to save memory
+        a, _ = self.attn(x, x, x, need_weights=False)   # no big attn weights
+        x = x + self.drop(a)
 
-        # LN1 in fp32 → back to original dtype
+        # ── LN1 in fp32, cast back
         with torch.cuda.amp.autocast(enabled=False):
             x = self.ln1(x.float()).to(dtype_in)
 
-        # FFN in fp32 → back to original dtype  (prevents bfloat16@float32 matmul)
+        # ── FFN in fp32, cast back (prevents dtype mismatch in Linear)
         with torch.cuda.amp.autocast(enabled=False):
             f = self.ff(x.float())
         x = x + self.drop(f.to(dtype_in))
 
-        # LN2 in fp32 → back to original dtype
+        # ── LN2 in fp32, cast back
         with torch.cuda.amp.autocast(enabled=False):
             x = self.ln2(x.float()).to(dtype_in)
 
         return x
+
 
 class CrossAssetAttention(nn.Module):
     def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.08):
@@ -266,7 +270,26 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         fused.add_(t)
         # Transformer over TIME per asset (memory-safe): L = window, not assets*window
         seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
-        seq = self.blocks(seq)                                  # [B*N, W, E]
+       # Memory-guard: if B*N is large, split across batch to cap attn memory
+        BN, L, E = seq.shape
+        H = self.blocks[0].attn.num_heads if len(self.blocks) > 0 else 1
+        dtype_bytes = 2 if seq.dtype in (torch.float16, torch.bfloat16) else 4
+
+        # Rough upper bound for attention intermediates (no weights returned):
+        approx_bytes = BN * H * L * L * dtype_bytes
+        MAX_BYTES = 1_200_000_000  # ~1.2 GB per forward chunk
+
+        if approx_bytes > MAX_BYTES:
+            chunks = int(math.ceil(approx_bytes / MAX_BYTES))
+            parts = []
+            for xi in seq.chunk(chunks, dim=0):
+                parts.append(self.blocks(xi))
+            seq = torch.cat(parts, dim=0)
+        else:
+            seq = self.blocks(seq)
+
+
+
 
         dtype_in = seq.dtype
         with torch.cuda.amp.autocast(enabled=False):
