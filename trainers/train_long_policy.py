@@ -17,6 +17,7 @@ from stable_baselines3.common.callbacks import BaseCallback, EventCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 import subprocess
+from stable_baselines3.common.vec_env import VecNormalize
 
 # Policies / extractor (the recurrent policy may or may not exist in your repo)
 from models.long_policy import (
@@ -774,6 +775,8 @@ class LongBacktestEnv(gym.Env):
             time_since_last_trade=global_since_last_trade
         ).item())
 
+        info["reward_components"] = getattr(self.reward_fn, "last_components", None)
+
         # keep your existing illegal-action penalties
         if any_illegal_attempt:
             reward += ILLEGAL_ATTEMPT_PENALTY
@@ -878,8 +881,16 @@ def train_long_policy(
 
     # VecEnv
     env_fns = [make_long_env(i, SEED, window) for i in range(n_envs)]
-    vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
+    base_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
+    # Reward normalization stabilizes the critic and advantage scale
+    vec_env = VecNormalize(
+        base_env,
+        norm_obs=False,          # leave obs as-is (you already layernorm inside the net)
+        norm_reward=True,        # <-- key
+        gamma=0.995,
+        clip_reward=5.0
+    )
     n_steps = 1024
     rollout = n_steps * n_envs
     for cand in (1024, 512, 256, 128, 64):

@@ -368,6 +368,19 @@ class RewardFunction(nn.Module):
         C8 = _clip(churn_pen + sltp_pen)
 
         total = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8
+        # Expose component breakdown (pre-final-clip) for logging/debug
+        self.last_components = {
+            "C1_realizedR": float(C1),
+            "C2_quality": float(C2),
+            "C3_unreal": float(C3),
+            "C4_inactivity": float(C4),
+            "C5_holding": float(C5),
+            "C6_overexp": float(C6),
+            "C7_conflict": float(C7),
+            "C8_churnSLTP": float(C8),
+            "total_before_clip": float(total),
+        }
+
 
         # Optional final clamp (wider than ±1 to keep gradients alive)
         if self.final_clip is not None and self.final_clip > 0:
