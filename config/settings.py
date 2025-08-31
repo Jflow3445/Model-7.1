@@ -98,12 +98,14 @@ LIVE_FOREX_PAIRS: Final[List[str]] = ['EURUSD', 'USDJPY', 'GBPUSD', 'USDCAD', 'U
                                       'CADJPY', 'CADSGD', 'CHFJPY', 'EURAUD', 'EURCAD', 
                                       'EURCHF', 'EURJPY', 'EURNZD', 'GBPAUD', 'GBPCAD', 
                                       'GBPCHF', 'GBPJPY', 'GBPNZD', 'NZDJPY', 'XAGEUR', 
-                                      'XAGUSD', 'XAUAUD', 'XAUEUR', 'USDSGD', 'USDCZK', 
-                                      'USDHUF', 'USDMXN', 'USDNOK', 'SGDJPY', 'AUDNZD', 
-                                      'USDPLN', 'USDSEK', 'USDCNH', 'NZDCAD', 'USDTRY', 
+                                      'XAGUSD', 'XAUAUD', 'XAUEUR', 'USDSGD',  
+                                      'USDHUF', 'USDMXN',  'SGDJPY', 'AUDNZD', 
+                                        'USDCNH', 'NZDCAD', 
                                       'USDZAR', 'ZARJPY', 'NZDCHF', 'AUDCHF', 'EURGBP', 
-                                      'AUDJPY', 'CHFSGD', 'NZDSGD', 'NZDHUF', 'EURCNH', 
-                                      'GBPDKK']
+                                      'AUDJPY', 'CHFSGD', 'NZDSGD', 'NZDHUF', #EURCNH', 
+                                     #'GBPDKK','USDPLN', 'USDSEK'
+                                     #'USDNOK','USDCZK', 'USDTRY', 
+                                      ]
 NUM_PAIRS: Final[int] = len(LIVE_FOREX_PAIRS)
 
 # --------------------------------------------------------------------------- #
