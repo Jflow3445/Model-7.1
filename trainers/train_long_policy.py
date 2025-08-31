@@ -860,7 +860,7 @@ def train_long_policy(
             batch_size = cand
             break
     print(f"[train_long] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
-    batch_size = 2048
+    
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
