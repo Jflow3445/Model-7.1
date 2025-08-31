@@ -277,10 +277,12 @@ class RewardFunction(nn.Module):
         # --- C3: unrealized normalized by balance (optional, small weight) ---
         unreal_norm = float(unrealized_pnl) / max(self.initial_balance, eps)
 
-        # --- C4: inactivity (steps-based) ---
-        steps_since_last = max(float(time_since_last_trade), 0.0)
-        extra_steps = max(0.0, steps_since_last - float(self.inactivity_grace_steps))
-        inactivity_pen = -self.inactivity_weight * extra_steps
+        # --- C4: inactivity (steps-based) — apply only when FLAT (no open trades) ---
+        inactivity_pen = 0.0
+        if not open_trades:
+            steps_since_last = max(float(time_since_last_trade), 0.0)
+            extra_steps = max(0.0, steps_since_last - float(self.inactivity_grace_steps))
+            inactivity_pen = -self.inactivity_weight * extra_steps
 
         # --- C5: holding penalty (per open trade beyond threshold steps) ---
         holding_pen_total = 0.0

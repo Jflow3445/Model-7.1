@@ -347,22 +347,28 @@ class OneMinBacktestEnv(gym.Env):
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
         self.reward_fn = RewardFunction(
-            initial_balance=self.initial_balance,
-            slippage_per_unit=SLIPPAGE_PER_UNIT,
-            commission_per_trade=COMMISSION_PER_TRADE,
+        initial_balance=self.initial_balance,
+        slippage_per_unit=SLIPPAGE_PER_UNIT,
+        commission_per_trade=COMMISSION_PER_TRADE,
 
-            inactivity_weight=0.0008,
-            inactivity_grace_steps=120,          # ~2 hours grace
-            holding_threshold_steps=180,         # start nudging after 45 mins in trade
-            holding_penalty_per_step=0.001,
+        # time pressure ↓ and only when flat (see reward_utils change)
+        inactivity_weight=0.0001,
+        inactivity_grace_steps=120,
+        holding_threshold_steps=180,
+        holding_penalty_per_step=0.001,
 
-            risk_budget_R=4.0,
-            overexposure_weight=0.02,
-            unrealized_weight=0.03,
-            component_clip=2.0,
-            final_clip=2.5,
-            integrate_costs_in_reward=False, 
-        )
+        # slightly stronger positive signal for realized R,
+        # slightly softer overexposure pressure
+        realized_R_weight=1.5,
+        risk_budget_R=4.0,
+        overexposure_weight=0.015,
+
+        unrealized_weight=0.03,
+        component_clip=2.0,
+        final_clip=2.5,
+        integrate_costs_in_reward=False,
+    )
+
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
         self.runtime_max_steps: int = 0    # per-reset cap after ATR/cleaning across symbols
@@ -670,25 +676,37 @@ class OneMinBacktestEnv(gym.Env):
                 info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
 
   
-            # === Auto-close by SL/TP using next bar high/low ===
+           # === Auto-close by SL/TP using next bar high/low ===
             if not trade_executed:
                 ot = self._get_open_trade(sym)
                 if ot is not None:
-                    hit = False
-                    if ot["trade_type"] == "long":
-                        if next_low <= ot["stop_loss"]:
-                            pnl = ot["stop_loss"] - ot["entry_price"]
-                            exit_px = ot["stop_loss"]; stop_type = "sl"; hit = True
-                        elif next_high >= ot["take_profit"]:
-                            pnl = ot["take_profit"] - ot["entry_price"]
-                            exit_px = ot["take_profit"]; stop_type = "tp"; hit = True
+                    long_side = (ot["trade_type"] == "long")
+                    sl = float(ot["stop_loss"])
+                    tp = float(ot["take_profit"])
+                    entry = float(ot["entry_price"])
+
+                    hit_sl = (next_low <= sl) if long_side else (next_high >= sl)
+                    hit_tp = (next_high >= tp) if long_side else (next_low <= tp)
+
+                    # If both levels are inside the next bar, decide by proximity to next_open (proxy for first touch)
+                    if hit_sl and hit_tp:
+                        sl_dist = abs(next_open - sl)
+                        tp_dist = abs(next_open - tp)
+                        prefer_sl = sl_dist <= tp_dist
+                        hit_sl, hit_tp = prefer_sl, (not prefer_sl)
+
+                    if hit_sl:
+                        exit_px = sl
+                        pnl = (sl - entry) if long_side else (entry - sl)
+                        stop_type = "sl"
+                        hit = True
+                    elif hit_tp:
+                        exit_px = tp
+                        pnl = (tp - entry) if long_side else (entry - tp)
+                        stop_type = "tp"
+                        hit = True
                     else:
-                        if next_high >= ot["stop_loss"]:
-                            pnl = ot["entry_price"] - ot["stop_loss"]
-                            exit_px = ot["stop_loss"]; stop_type = "sl"; hit = True
-                        elif next_low <= ot["take_profit"]:
-                            pnl = ot["entry_price"] - ot["take_profit"]
-                            exit_px = ot["take_profit"]; stop_type = "tp"; hit = True
+                        hit = False
 
                     if hit:
                         closed = dict(
@@ -705,6 +723,7 @@ class OneMinBacktestEnv(gym.Env):
                         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                         info["closed_trades"].append(closed)
                         trade_executed = True
+
 
             self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
             info["symbols"][sym] = {
