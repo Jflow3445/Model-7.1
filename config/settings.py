@@ -52,9 +52,9 @@ ENABLE_LONG:   bool = bool(int(_env("ENABLE_LONG",   0)))
 # --------------------------------------------------------------------------- #
 LIVE_TICK_BUFFER:     Final[int]   = int(_env("LIVE_TICK_BUFFER", 10000))
 LIVE_OBS_WINDOW:      Final[int]   = int(_env("LIVE_OBS_WINDOW", 300))
-MEDIUM_OBS_WINDOW:    Final[int]   = int(_env("MEDIUM_OBS_WINDOW", 45))
-LONG_OBS_WINDOW:      Final[int]   = int(_env("LONG_OBS_WINDOW", 45))
-ONEMIN_OBS_WINDOW:    Final[int]   = int(_env("ONEMIN_OBS_WINDOW", 45))
+MEDIUM_OBS_WINDOW:    Final[int]   = int(_env("MEDIUM_OBS_WINDOW", 40))
+LONG_OBS_WINDOW:      Final[int]   = int(_env("LONG_OBS_WINDOW", 40))
+ONEMIN_OBS_WINDOW:    Final[int]   = int(_env("ONEMIN_OBS_WINDOW", 40))
 SIMULATED_TICK_DATA_FREQUENCY: Final[int] = int(_env("SIMULATED_TICK_DATA_FREQUENCY", 60))
 
 # --------------------------------------------------------------------------- #
