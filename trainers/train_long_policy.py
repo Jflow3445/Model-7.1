@@ -198,6 +198,27 @@ class SaveBestModelCallback(BaseCallback):
             return True
 
         mean_reward = float(np.mean(results))
+        # Print last-200 episode means for any rw_* columns if present
+        try:
+            comp_means = {}
+            for i in range(self.training_env.num_envs):
+                monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
+                if os.path.exists(monitor_file):
+                    df = pd.read_csv(monitor_file, skiprows=1)
+                    cols = [c for c in df.columns if c.startswith("rw_")]
+                    if cols:
+                        tail = df[cols].tail(200)
+                        # merge (mean across envs)
+                        for c in cols:
+                            comp_means[c] = comp_means.get(c, []) + [tail[c].mean()]
+            if comp_means and self.verbose:
+                msg = " | ".join(
+                    f"{k}={np.nanmean(v):.3f}" for k, v in sorted(comp_means.items())
+                )
+                print(f"[Diagnostics] {msg}")
+        except Exception:
+            pass
+
         if self.verbose:
             print(f"[SaveBestModel] mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f}")
 
@@ -776,6 +797,23 @@ class LongBacktestEnv(gym.Env):
         ).item())
 
         info["reward_components"] = getattr(self.reward_fn, "last_components", None)
+        # ── Diagnostics to log via Monitor (flatten keys) ─────────────────────────────
+        rc = getattr(self.reward_fn, "last_components", {}) or {}
+        for k in (
+            "C1_realizedR", "C2_quality", "C3_unreal", "C4_inactivity",
+            "C5_holding", "C6_overexp", "C7_conflict", "C8_churnSLTP",
+            "total_before_clip",
+        ):
+            v = rc.get(k, None)
+            if v is not None:
+                info[f"rw_{k}"] = float(v)
+
+        info["n_open"] = int(len(self.open_trades))
+        info["n_closed"] = int(len(info["closed_trades"]))
+        info["illegal_attempts"] = int(any_illegal_attempt)
+        info["since_last_trade"] = float(global_since_last_trade)
+        # ──────────────────────────────────────────────────────────────────────────────
+
 
         # keep your existing illegal-action penalties
         if any_illegal_attempt:
@@ -840,7 +878,17 @@ def make_long_env(rank: int, seed: int, window: int, symbols=None) -> Callable[[
         env.seed(seed + rank)
         log_dir = os.path.join(LOGS_DIR, f"long_worker_{rank}")
         os.makedirs(log_dir, exist_ok=True)
-        env = Monitor(env, filename=os.path.join(log_dir, "monitor.csv"))
+        env = Monitor(
+        env,
+        filename=os.path.join(log_dir, "monitor.csv"),
+        info_keywords=(
+            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
+            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+            "rw_total_before_clip",
+         ),
+         )
+
         return env
     return _init
 
