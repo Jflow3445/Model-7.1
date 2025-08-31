@@ -877,6 +877,7 @@ def train_long_policy(
         max_grad_norm=0.5,
         tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
         device="cuda",
+        n_epochs=20,      
     )
     policy_kwargs = dict(
     window=window,

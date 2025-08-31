@@ -14,9 +14,12 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution
 try:
-    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+    from torch.nn.attention import sdpa_kernel
+    with sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
+        pass
 except Exception:
     pass
+
 
 logger = logging.getLogger("LongPolicy")
 logger.setLevel(logging.INFO)
@@ -152,11 +155,16 @@ class CrossAssetAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype_in = x.dtype
-        # MHA in fp32
-        with torch.cuda.amp.autocast(enabled=False):
-            y, _ = self.attn(x.float(), x.float(), x.float())
-            out = self.ln((x + y).float())  # LN in fp32 too
-        return out.to(dtype_in)
+        B = x.size(0)
+        max_rows = int(os.environ.get("LONG_XATTN_MAX_ROWS", "4096"))
+        outs = []
+        for xi in x.split(max_rows, dim=0):
+            with torch.cuda.amp.autocast(enabled=False):  # fp32 numerics
+                y, _ = self.attn(xi.float(), xi.float(), xi.float(), need_weights=False)
+                o = self.ln((xi.float() + y))
+            outs.append(o.to(dtype_in))
+        return torch.cat(outs, dim=0)
+
 
 class AttnPool1D(nn.Module):
     def __init__(self, embed_dim: int):
@@ -281,29 +289,33 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         # ── Adaptive row chunking across the whole stack (robust against OOM)
         BN, L, E = seq.shape
         bytes_per = 2 if seq.dtype in (torch.float16, torch.bfloat16) else 4
-        max_rows_cap = int(os.environ.get("LONG_MAX_ROWS", "2048"))  # upper bound you can tune
+        max_rows_cap = int(os.environ.get("LONG_MAX_ROWS", "8192"))  # default higher to reduce overhead
 
         def _adaptive_rows():
+            # try to size chunks from *free* VRAM so we skip chunking when possible
             try:
                 free_bytes, _ = torch.cuda.mem_get_info()
             except Exception:
-                # Fallback if mem_get_info is unavailable
                 return max_rows_cap
-            # Safety factor (~16) to cover FFN/MHA workspaces + activations
-            denom = max(1, L * E * bytes_per * 16)
-            rows = int((free_bytes * 0.80) // denom)  # keep 20% headroom
+            # generous safety: account for FFN/attn workspaces
+            denom = max(1, L * E * bytes_per * 8)
+            rows = int((free_bytes * 0.85) // denom)
             return max(64, min(max_rows_cap, rows))
 
-        parts = []
-        start = 0
-        while start < BN:
-            rows = _adaptive_rows()
-            end = min(BN, start + rows)
-            xi = seq[start:end]
-            yi = self.blocks(xi)  # run all transformer layers on this chunk
-            parts.append(yi)
-            start = end
-        seq = torch.cat(parts, dim=0)  # [B*N, W, E]
+        rows = _adaptive_rows()
+        if rows >= BN:
+            # fast path: whole batch at once
+            seq = self.blocks(seq)
+        else:
+            parts = []
+            start = 0
+            while start < BN:
+                end = min(BN, start + rows)
+                xi = seq[start:end]
+                yi = self.blocks(xi)
+                parts.append(yi)
+                start = end
+            seq = torch.cat(parts, dim=0)
 
 
         dtype_in = seq.dtype
