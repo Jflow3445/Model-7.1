@@ -266,8 +266,6 @@ class RewardFunction(nn.Module):
         realized_R_sum = float(sum(realized_r_list)) if closed_count else 0.0
         realized_R_mean = (realized_R_sum / closed_count) if closed_count else 0.0
 
-        closed_count = len(realized_r_list)
-        realized_R_mean = (sum(realized_r_list) / closed_count) if closed_count > 0 else 0.0
 
 
        # --- C2: EMA quality (bounded) — use DELTA so no per-step bleed when idle ---
@@ -369,7 +367,7 @@ class RewardFunction(nn.Module):
                 return -c
             return x
 
-        C1 = _clip(self.realized_R_weight * realized_R_mean)
+        C1 = _clip(self.realized_R_weight * realized_R_mean, c=min(self.component_clip, self.r_clip))
         C2 = _clip(self.quality_weight * quality_delta)
         C3 = _clip(self.unrealized_weight * unreal_norm)
         C4 = _clip(inactivity_pen)
