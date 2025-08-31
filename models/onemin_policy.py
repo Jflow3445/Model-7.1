@@ -56,8 +56,32 @@ class DSConv1d(nn.Module):
         orthogonal_init(self.pw, gain=1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dw(x); x = self.pw(x); x = self.bn(x)
-        return self.drop(F.gelu(x))
+        # x: [B*, C_in, W]
+        B, Cin, W = x.shape
+        # Make sure both input AND output per chunk stay within 32-bit index math.
+        # Keep a safety margin under 2^31-1.
+        MAX_ELEMS = 1_500_000_000  # ~1.5e9 as a safe ceiling
+
+        # Worst-case channels seen by kernels in this block
+        Cout = self.pw.out_channels if hasattr(self.pw, "out_channels") else Cin
+        per_row_in  = Cin * W
+        per_row_out = max(Cin, Cout) * W
+        per_row = max(per_row_in, per_row_out)
+
+        # How many rows (batch items) can we process per chunk?
+        max_rows = max(1, MAX_ELEMS // max(1, per_row))
+        if B <= max_rows:
+            y = self.dw(x); y = self.pw(y); y = self.bn(y)
+            return self.drop(F.gelu(y))
+
+        # Chunk along batch dim so each conv sees a small enough tensor
+        chunks = int(math.ceil(B / max_rows))
+        parts = []
+        for xi in x.chunk(chunks, dim=0):
+            yi = self.dw(xi); yi = self.pw(yi); yi = self.bn(yi)
+            yi = self.drop(F.gelu(yi))
+            parts.append(yi)
+        return torch.cat(parts, dim=0)
 
 class SE1d(nn.Module):
     def __init__(self, ch: int, r: int = 8):
