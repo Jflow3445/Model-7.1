@@ -44,7 +44,7 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 # ──────────────────────────────────────────────────────────────────────────────
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
-ILLEGAL_ATTEMPT_PENALTY = -0.01
+ILLEGAL_ATTEMPT_PENALTY = -0.002
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -351,25 +351,21 @@ class LongBacktestEnv(gym.Env):
         self.reward_fn = RewardFunction(
         initial_balance=self.initial_balance,
         slippage_per_unit=SLIPPAGE_PER_UNIT,
-        commission_per_trade=COMMISSION_PER_TRADE,
-
-        # time pressure ↓ and only when flat (see reward_utils change)
-        inactivity_weight=0.0002,
+        commission_per_trade=0.0, 
+        integrate_costs_in_reward=True,
+        commission_per_trade=0.0,
+        inactivity_weight=0.00005,
         inactivity_grace_steps=60,
-        holding_threshold_steps=30,
-        holding_penalty_per_step=0.0005,
-
-        # stronger realized-R signal
+        holding_threshold_steps=80,
+        holding_penalty_per_step=0.0002,
         realized_R_weight=1.5,
-
         risk_budget_R=risk_budget,
         overexposure_weight=0.015,
         unrealized_weight=0.03,
-        component_clip=2.0,
-        final_clip=2.5,
+        component_clip=3.0,
+        final_clip=5.0,
         integrate_costs_in_reward=True,
-    )
-
+        )
 
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
@@ -508,6 +504,7 @@ class LongBacktestEnv(gym.Env):
         reward = 0.0
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
+        any_illegal_attempt = False
         for i, sym in enumerate(self.symbols):
             df = self.dfs[sym]
             act = action[i * 10: (i + 1) * 10]
@@ -561,7 +558,8 @@ class LongBacktestEnv(gym.Env):
 
             attempted_illegal = not valid[orig_action]
             if attempted_illegal:
-                illegal_penalty_total += ILLEGAL_ATTEMPT_PENALTY
+                any_illegal_attempt = True
+
 
             # Prices
             # Use ONLY information available in the current observation (idx-1):
@@ -752,7 +750,8 @@ class LongBacktestEnv(gym.Env):
         ).item())
 
         # keep your existing illegal-action penalties
-        reward += illegal_penalty_total
+        if any_illegal_attempt:
+            reward += ILLEGAL_ATTEMPT_PENALTY
 
         # final clip AFTER penalties, same as 1-min
         final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0

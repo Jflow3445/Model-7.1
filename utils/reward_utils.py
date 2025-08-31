@@ -289,13 +289,17 @@ class RewardFunction(nn.Module):
             extra_steps = max(0.0, steps_since_last - float(self.inactivity_grace_steps))
             inactivity_pen = -self.inactivity_weight * extra_steps
 
-        # --- C5: holding penalty (per open trade beyond threshold steps) ---
+        # --- C5: holding penalty (average excess hold time; avoids per-step saturation) ---
         holding_pen_total = 0.0
         if open_trades:
+            excesses = []
             for t in open_trades:
                 ht = _safe_float(t.get("holding_time", 0.0))
                 if ht > self.holding_threshold_steps:
-                    holding_pen_total -= self.holding_penalty_per_step * (ht - self.holding_threshold_steps)
+                    excesses.append(ht - self.holding_threshold_steps)
+            if excesses:
+                avg_excess = sum(excesses) / max(1, len(excesses))
+                holding_pen_total = -self.holding_penalty_per_step * avg_excess
 
         # --- C6: overexposure penalty (risk budget in R units) ---
         # Approximate each open trade as 1R of risk unless missing SL; if missing SL, treat as >1R to force discipline
