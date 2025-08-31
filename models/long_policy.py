@@ -6,7 +6,8 @@ from typing import Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import os
+from torch.utils.checkpoint import checkpoint
 from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
