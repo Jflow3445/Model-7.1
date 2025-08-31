@@ -119,24 +119,28 @@ class TransformerBlock(nn.Module):
         orthogonal_init(self.attn); orthogonal_init(self.ff[0]); orthogonal_init(self.ff[-1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Keep the incoming dtype for the return path (usually bf16 under AMP)
-        dtype_in = x.dtype
+        orig_dtype = x.dtype  # usually bfloat16 under AMP
 
-        # ── MHA: force bf16 autocast locally so params + inputs match at matmul time
-        # This avoids "BFloat16 != float" even if upstream autocast is off.
+        # ── MHA under bf16 (saves memory); don't return weights
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-            a, _ = self.attn(x, x, x, need_weights=False)  # no weights to save memory
-        x = x + self.drop(a)  # still bf16 here
+            a, _ = self.attn(x, x, x, need_weights=False)
+            x = x + self.drop(a)
 
-        # ── LN + FFN in fp32 for stability; cast back to the original dtype
+        # ── LN1 in fp32 for stability
         with torch.cuda.amp.autocast(enabled=False):
             x = self.ln1(x.float())
-            f = self.ff(x)            # fp32 matmuls (no dtype clash)
-            x = x + self.drop(f)      # still fp32
-            x = self.ln2(x)           # fp32
-            x = x.to(dtype_in)        # back to bf16 for downstream
+
+        # ── FFN in bf16 to slash activation memory
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+            f = self.ff(x.to(torch.bfloat16))
+            x = x + self.drop(f)
+
+        # ── LN2 in fp32, then back to original dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.ln2(x.float()).to(orig_dtype)
 
         return x
+
 
 
 class CrossAssetAttention(nn.Module):
@@ -308,10 +312,6 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
                     h = checkpoint(blk, h) if (self.use_checkpoint and self.training) else blk(h)
 
             seq = h  # [B*N, W, E]
-
-
-
-
 
         dtype_in = seq.dtype
         with torch.cuda.amp.autocast(enabled=False):
