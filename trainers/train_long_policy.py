@@ -367,7 +367,7 @@ class LongBacktestEnv(gym.Env):
         unrealized_weight=0.03,
         component_clip=2.0,
         final_clip=2.5,
-        integrate_costs_in_reward=False,
+        integrate_costs_in_reward=True,
     )
 
 
@@ -787,8 +787,11 @@ class LongBacktestEnv(gym.Env):
         )
         self.open_trades.append(trade)
         # Pay costs upfront
-        cost = _to_float(self.reward_fn.slippage_per_unit) + _to_float(self.reward_fn.commission_per_trade)
-        self.balance -= cost
+        # Pay costs to balance only if NOT integrated into reward
+        if not getattr(self.reward_fn, "integrate_costs_in_reward", False):
+            cost = _to_float(self.reward_fn.slippage_per_unit) + _to_float(self.reward_fn.commission_per_trade)
+            self.balance -= cost
+
 
     def render(self, mode="human"):
         idx = self.cursor
