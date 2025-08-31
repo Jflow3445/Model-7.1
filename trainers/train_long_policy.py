@@ -100,17 +100,26 @@ def _safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
 def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
                  is_long: bool, min_stop_price: float, atr_value: float) -> Tuple[float, float]:
     """
-    Map normalized [-1,1] to price distances using ATR + broker floor.
+    Map normalized [-1,1] to price distances using ATR + broker + price floors.
+    Prevents microscopic stops when ATR is tiny.
     """
     FLOOR_FRAC_ATR = 0.40
     K_SL_ATR = 0.80
     K_TP_ATR = 1.60
 
-    atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
-    floor_price = max(float(min_stop_price or 0.0), FLOOR_FRAC_ATR * atr_value)
+    # NEW: price-based floor (e.g., 5 bps of price)
+    PRICE_FRAC_FLOOR = 5e-4  # 0.05% of price
 
-    sl_dist = max(floor_price, (0.5 + abs(sl_norm)) * K_SL_ATR * max(atr_value, 1e-12))
-    tp_dist = max(floor_price, (0.5 + abs(tp_norm)) * K_TP_ATR * max(atr_value, 1e-12))
+    entry = float(entry)
+    atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
+
+    price_floor = PRICE_FRAC_FLOOR * abs(entry)
+    atr_base = max(atr_value, price_floor)  # NEW: never smaller than price floor
+
+    floor_price = max(float(min_stop_price or 0.0), FLOOR_FRAC_ATR * atr_base)
+
+    sl_dist = max(floor_price, (0.5 + abs(sl_norm)) * K_SL_ATR * atr_base)
+    tp_dist = max(floor_price, (0.5 + abs(tp_norm)) * K_TP_ATR * atr_base)
 
     if is_long:
         sl = entry - sl_dist
@@ -424,29 +433,33 @@ class LongBacktestEnv(gym.Env):
         risk_budget = max(6.0, 0.75 * self.n_assets)
 
         self.reward_fn = RewardFunction(
-            initial_balance=self.initial_balance,
-            slippage_per_unit=SLIPPAGE_PER_UNIT,
-            commission_per_trade=COMMISSION_PER_TRADE,   # use settings value
-            integrate_costs_in_reward=True,              # costs only in reward
+        initial_balance=self.initial_balance,
+        slippage_per_unit=SLIPPAGE_PER_UNIT,
+        commission_per_trade=COMMISSION_PER_TRADE,
+        integrate_costs_in_reward=True,
 
-            # time pressure ↓ and only when flat
-            inactivity_weight=0.00005,
-            inactivity_grace_steps=60,
+        # NEW: safer R floor; adjust if your price scale differs
+        min_risk=5e-4,
 
-            # holding penalty gentler
-            holding_threshold_steps=80,
-            holding_penalty_per_step=0.0002,
+        # time pressure ↓ and only when flat
+        inactivity_weight=0.00005,
+        inactivity_grace_steps=60,
 
-            # stronger realized-R signal
-            realized_R_weight=1.5,
+        # holding penalty gentler
+        holding_threshold_steps=80,
+        holding_penalty_per_step=0.0002,
 
-            risk_budget_R=risk_budget,
-            overexposure_weight=0.015,
-            unrealized_weight=0.03,
+        # slightly lower so C1 less likely to clip after switching to mean
+        realized_R_weight=1.0,
 
-            component_clip=3.0,
-            final_clip=5.0,
-        )
+        risk_budget_R=risk_budget,
+        overexposure_weight=0.015,
+        unrealized_weight=0.03,
+
+        component_clip=3.0,
+        final_clip=5.0,
+         )
+
 
 
         # Local indexing controls (fix)

@@ -257,7 +257,10 @@ class RewardFunction(nn.Module):
                     gross_profit_step += pnl_eff
                 elif pnl_eff < 0:
                     gross_loss_step += -pnl_eff  # absolute
-        realized_R_sum = float(sum(realized_r_list)) if realized_r_list else 0.0
+        closed_count = len(realized_r_list)
+        realized_R_sum = float(sum(realized_r_list)) if closed_count else 0.0
+        realized_R_mean = (realized_R_sum / closed_count) if closed_count else 0.0
+
         closed_count = len(realized_r_list)
         realized_R_mean = (sum(realized_r_list) / closed_count) if closed_count > 0 else 0.0
 
@@ -361,7 +364,7 @@ class RewardFunction(nn.Module):
                 return -c
             return x
 
-        C1 = _clip(self.realized_R_weight * realized_R_sum)
+        C1 = _clip(self.realized_R_weight * realized_R_mean)
         C2 = _clip(self.quality_weight * quality_delta)
         C3 = _clip(self.unrealized_weight * unreal_norm)
         C4 = _clip(inactivity_pen)
