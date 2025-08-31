@@ -120,15 +120,16 @@ class TransformerBlock(nn.Module):
             a, _ = self.attn(x.float(), x.float(), x.float())
         x = x + self.drop(a.to(dtype_in))
 
-        # LN1 in fp32 → cast back
+        # LN1 in fp32 → back to original dtype
         with torch.cuda.amp.autocast(enabled=False):
             x = self.ln1(x.float()).to(dtype_in)
 
-        # FFN can stay under outer AMP (bf16)
-        f = self.ff(x)
-        x = x + self.drop(f)
+        # FFN in fp32 → back to original dtype  (prevents bfloat16@float32 matmul)
+        with torch.cuda.amp.autocast(enabled=False):
+            f = self.ff(x.float())
+        x = x + self.drop(f.to(dtype_in))
 
-        # LN2 in fp32 → cast back
+        # LN2 in fp32 → back to original dtype
         with torch.cuda.amp.autocast(enabled=False):
             x = self.ln2(x.float()).to(dtype_in)
 
@@ -281,6 +282,8 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         # Cross-asset attention (short sequence length = N assets)
         y = self.cross(y)
         y = self.final_drop(y)                        # [B,N,E]
+        fdtype = self.extras_proj.weight.dtype  # typically torch.float32
+        y = y.to(fdtype)
 
         # ── Extras: window-level OHLC features (24 -> project to 5 per asset) ────────
         # Compute stats without tracking grads to save a LOT of memory
@@ -370,7 +373,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             ], dim=-1)   # [B,N,24]
 
         # Project to 5 per asset; grads only flow into this linear
-        extras_24 = extras_24.to(self.extras_proj.weight.dtype)
+        extras_24 = extras_24.to(fdtype)
         extras_5 = self.extras_proj(extras_24)      # [B,N,5]
         extras   = extras_5.reshape(B, -1)          # [B, N*5]
 
