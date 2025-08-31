@@ -854,7 +854,7 @@ def train_onemin_policy(
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
     n_steps = 2048
-    batch_size = 2048
+    batch_size = 1024
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
