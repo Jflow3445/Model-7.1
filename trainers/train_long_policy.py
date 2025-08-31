@@ -512,6 +512,7 @@ class LongBacktestEnv(gym.Env):
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
         any_illegal_attempt = False
+        curr_close_by_sym: Dict[str, float] = {}
         for i, sym in enumerate(self.symbols):
             df = self.dfs[sym]
             act = action[i * 10: (i + 1) * 10]
@@ -575,6 +576,7 @@ class LongBacktestEnv(gym.Env):
                 curr_idx = 0
             curr_close = float(df.at[curr_idx, "close"])
             atr_val    = float(df.at[curr_idx, "atr"])
+            curr_close_by_sym[sym] = curr_close
 
             # Next bar (orders execute / SL/TP evaluated here)
             next_open  = float(df.at[next_idx, "open"])
@@ -743,16 +745,32 @@ class LongBacktestEnv(gym.Env):
 
         # include holding_time for open trades so C5 works
         open_trades_for_reward = []
+        
         for t in self.open_trades:
             td = dict(t)
             td["holding_time"] = self.current_step - td.get("open_step", self.current_step)
             open_trades_for_reward.append(td)
 
+        # Compute unrealized PnL using last observed closes (curr_idx), no leakage
+        unrealized_pnl = 0.0
+        for t in self.open_trades:
+            sym = t["symbol"]
+            cc = curr_close_by_sym.get(sym)
+            if cc is None:
+                df_sym = self.dfs[sym]
+                ci = max(idx - 1, 0)
+                cc = float(df_sym.at[ci, "close"])
+            entry = float(t["entry_price"])
+            if t["trade_type"] == "long":
+                unrealized_pnl += (cc - entry)
+            else:
+                unrealized_pnl += (entry - cc)
+
         reward = float(self.reward_fn(
             closed_trades=info["closed_trades"],      # may be []
             open_trades=open_trades_for_reward,       # includes holding_time
             account_balance=self.balance,
-            unrealized_pnl=0.0,
+            unrealized_pnl=float(unrealized_pnl),
             time_since_last_trade=global_since_last_trade
         ).item())
 
