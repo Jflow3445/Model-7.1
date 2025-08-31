@@ -26,6 +26,7 @@ if not logger.handlers:
     _fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%Y-%m-%dT%H:%M:%SZ")
     _ch.setFormatter(_fmt)
     logger.addHandler(_ch)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared utils/blocks (mirrors long policy upgrades)
@@ -218,6 +219,9 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             TransformerBlock(embed_dim, n_heads, embed_dim * 4, dropout_p=dropout)
             for _ in range(n_layers)
         ])
+        self.use_checkpoint = True  # saves VRAM during training
+        self.max_tokens_per_chunk = int(os.environ.get("LONG_MAX_TOKENS", "120000"))
+
         self.time_pool = AttnPool1D(embed_dim)
         self.cross = CrossAssetAttention(embed_dim, n_heads, dropout)
         self.final_ln = nn.LayerNorm(embed_dim)
@@ -285,7 +289,26 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
                 parts.append(self.blocks(xi))
             seq = torch.cat(parts, dim=0)
         else:
-            seq = self.blocks(seq)
+            # Run each TransformerBlock with token-aware chunking (caps FFN memory), with optional checkpointing.
+            h = seq
+            L = h.size(1)
+            max_tokens = max(8_000, int(self.max_tokens_per_chunk))  # floor for safety
+
+            for blk in self.blocks:
+                BN = h.size(0)
+                tokens = BN * L
+                if tokens > max_tokens:
+                    chunks = int(math.ceil(tokens / max_tokens))
+                    parts = []
+                    for xi in h.chunk(chunks, dim=0):
+                        yi = checkpoint(blk, xi) if (self.use_checkpoint and self.training) else blk(xi)
+                        parts.append(yi)
+                    h = torch.cat(parts, dim=0)
+                else:
+                    h = checkpoint(blk, h) if (self.use_checkpoint and self.training) else blk(h)
+
+            seq = h  # [B*N, W, E]
+
 
 
 
