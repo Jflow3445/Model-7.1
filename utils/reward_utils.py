@@ -58,8 +58,13 @@ def _r_multiple_from_trade(trade: Dict, min_risk: float, r_clip: float) -> float
     vol = _safe_float(trade.get("volume", 1.0)) or 1.0
     side = _trade_side(trade)
 
-    risk = _risk_distance(entry, sl, side) * abs(vol)
-    risk = max(risk, min_risk)
+    risk_open = _safe_float(trade.get("risk_at_open", 0.0))
+    if risk_open > 0.0:
+        risk = max(risk_open * abs(vol), min_risk)
+    else:
+        risk = _risk_distance(entry, sl, side) * abs(vol)
+        risk = max(risk, min_risk)
+
     r = pnl / risk
     # robust bound
     if r > r_clip:

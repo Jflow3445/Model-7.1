@@ -678,133 +678,138 @@ class LongBacktestEnv(gym.Env):
             tp_norm = float(act[9])
 
             trade_executed = False
+
+            # --- Pre-check: SL/TP for an existing open trade on the next bar ---
             ot = self._get_open_trade(sym)
+            if ot is not None:
+                long_side = (ot["trade_type"] == "long")
+                sl = float(ot["stop_loss"]); tp = float(ot["take_profit"]); entry = float(ot["entry_price"])
 
-            # === Actions ===
-            if act_id == 1 and ot is None:  # buy
-                entry = next_open
-                sl_final, tp_final = _scale_sl_tp(
-                    entry=entry,
-                    sl_norm=sl_norm,
-                    tp_norm=tp_norm,
-                    is_long=True,
-                    min_stop_price=min_stop_price,
-                    atr_value=atr_val,
-                )
-                self._open_trade(sym, "long", entry, sl_final, tp_final)
-                trade_executed = True
+                hit_sl = (next_low <= sl) if long_side else (next_high >= sl)
+                hit_tp = (next_high >= tp) if long_side else (next_low <= tp)
 
-            elif act_id == 2 and ot is None:  # sell
-                entry = next_open
-                sl_final, tp_final = _scale_sl_tp(
-                    entry=entry,
-                    sl_norm=sl_norm,
-                    tp_norm=tp_norm,
-                    is_long=False,
-                    min_stop_price=min_stop_price,
-                    atr_value=atr_val,
-                )
-                self._open_trade(sym, "short", entry, sl_final, tp_final)
-                trade_executed = True
+                if hit_sl and hit_tp:
+                    # first-touch proxy by proximity to next_open
+                    sl_dist = abs(next_open - sl)
+                    tp_dist = abs(next_open - tp)
+                    prefer_sl = sl_dist <= tp_dist
+                    hit_sl, hit_tp = prefer_sl, (not prefer_sl)
 
-            elif act_id in (3, 4, 7) and ot is not None:
-    # Manual close at NEXT OPEN (no future leakage)
-                exit_px = next_open
-                if ot["trade_type"] == "long":
-                    pnl = exit_px - ot["entry_price"]
-                else:
-                    pnl = ot["entry_price"] - exit_px
-                closed = dict(
-                    **ot,
-                    exit_price=exit_px,
-                    pnl=pnl,
-                    slippage=_to_float(self.reward_fn.slippage_per_unit),
-                    commission=_to_float(self.reward_fn.commission_per_trade),
-                    close_step=self.current_step,
-                    stop_type="manual",
-                )
-                self.closed_trades.append(closed)
-                self.balance += closed["pnl"]
-                self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
-                info["closed_trades"].append(closed)
-                trade_executed = True
+                if hit_sl or hit_tp:
+                    exit_px = sl if hit_sl else tp
+                    pnl = (exit_px - entry) if long_side else (entry - exit_px)
+                    stop_type = "sl" if hit_sl else "tp"
+                    closed = dict(
+                        **ot,
+                        exit_price=exit_px,
+                        pnl=pnl,
+                        slippage=_to_float(self.reward_fn.slippage_per_unit),
+                        commission=_to_float(self.reward_fn.commission_per_trade),
+                        close_step=self.current_step,
+                        stop_type=stop_type,
+                    )
+                    self.closed_trades.append(closed)
+                    self.balance += closed["pnl"]
+                    self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
+                    info["closed_trades"].append(closed)
+                    trade_executed = True
 
-            elif act_id == 5 and ot is not None:
-                # Adjust Stop-Loss using the LAST OBSERVED close as reference (curr_close)
-                ref_price = curr_close
-                is_long = (ot["trade_type"] == "long")
-                new_sl, _unused = _scale_sl_tp(
-                    entry=ref_price,
-                    sl_norm=sl_norm,
-                    tp_norm=0.0,
-                    is_long=is_long,
-                    min_stop_price=min_stop_price,
-                    atr_value=atr_val,
-                )
-                floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
-                if is_long:
-                    new_sl = min(new_sl, ot["take_profit"] - floor_price, ref_price - floor_price)
-                else:
-                    new_sl = max(new_sl, ot["take_profit"] + floor_price, ref_price + floor_price)
-                ot["stop_loss"] = float(new_sl)
-                trade_executed = False
-                info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
+            # --- Action: only if nothing executed yet ---
+            if not trade_executed:
+                ot = self._get_open_trade(sym)  # refresh
 
-            elif act_id == 6 and ot is not None:
-                # Adjust Take-Profit using the LAST OBSERVED close as reference (curr_close)
-                ref_price = curr_close
-                is_long = (ot["trade_type"] == "long")
-                _unused, new_tp = _scale_sl_tp(
-                    entry=ref_price,
-                    sl_norm=0.0,
-                    tp_norm=tp_norm,
-                    is_long=is_long,
-                    min_stop_price=min_stop_price,
-                    atr_value=atr_val,
-                )
-                floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
-                if is_long:
-                    new_tp = max(new_tp, ot["stop_loss"] + floor_price, ref_price + floor_price)
-                else:
-                    new_tp = min(new_tp, ot["stop_loss"] - floor_price, ref_price - floor_price)
-                ot["take_profit"] = float(new_tp)
-                trade_executed = False
-                info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
-  
-            # === Auto-close by SL/TP using next bar high/low ===
-            # === Auto-close by SL/TP using next bar high/low ===
+                if act_id == 1 and ot is None:  # buy
+                    entry = next_open
+                    sl_final, tp_final = _scale_sl_tp(
+                        entry=entry, sl_norm=sl_norm, tp_norm=tp_norm,
+                        is_long=True, min_stop_price=min_stop_price, atr_value=atr_val,
+                    )
+                    self._open_trade(sym, "long", entry, sl_final, tp_final)
+                    trade_executed = True
+
+                elif act_id == 2 and ot is None:  # sell
+                    entry = next_open
+                    sl_final, tp_final = _scale_sl_tp(
+                        entry=entry, sl_norm=sl_norm, tp_norm=tp_norm,
+                        is_long=False, min_stop_price=min_stop_price, atr_value=atr_val,
+                    )
+                    self._open_trade(sym, "short", entry, sl_final, tp_final)
+                    trade_executed = True
+
+                elif act_id in (3, 4, 7) and ot is not None:
+                    # Manual close at NEXT OPEN (only if not already SL/TP-closed above)
+                    exit_px = next_open
+                    if ot["trade_type"] == "long":
+                        pnl = exit_px - ot["entry_price"]
+                    else:
+                        pnl = ot["entry_price"] - exit_px
+                    closed = dict(
+                        **ot,
+                        exit_price=exit_px,
+                        pnl=pnl,
+                        slippage=_to_float(self.reward_fn.slippage_per_unit),
+                        commission=_to_float(self.reward_fn.commission_per_trade),
+                        close_step=self.current_step,
+                        stop_type="manual",
+                    )
+                    self.closed_trades.append(closed)
+                    self.balance += closed["pnl"]
+                    self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
+                    info["closed_trades"].append(closed)
+                    trade_executed = True
+
+                elif act_id == 5 and ot is not None:
+                    # Adjust Stop-Loss using the LAST OBSERVED close as reference (curr_close)
+                    ref_price = curr_close
+                    is_long = (ot["trade_type"] == "long")
+                    new_sl, _unused = _scale_sl_tp(
+                        entry=ref_price, sl_norm=sl_norm, tp_norm=0.0,
+                        is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
+                    )
+                    floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                    if is_long:
+                        new_sl = min(new_sl, ot["take_profit"] - floor_price, ref_price - floor_price)
+                    else:
+                        new_sl = max(new_sl, ot["take_profit"] + floor_price, ref_price + floor_price)
+                    ot["stop_loss"] = float(new_sl)
+                    info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
+
+                elif act_id == 6 and ot is not None:
+                    # Adjust Take-Profit using the LAST OBSERVED close as reference (curr_close)
+                    ref_price = curr_close
+                    is_long = (ot["trade_type"] == "long")
+                    _unused, new_tp = _scale_sl_tp(
+                        entry=ref_price, sl_norm=0.0, tp_norm=tp_norm,
+                        is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
+                    )
+                    floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                    if is_long:
+                        new_tp = max(new_tp, ot["stop_loss"] + floor_price, ref_price + floor_price)
+                    else:
+                        new_tp = min(new_tp, ot["stop_loss"] - floor_price, ref_price - floor_price)
+                    ot["take_profit"] = float(new_tp)
+                    info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
+
+            # --- Post-check: if still open now (including newly opened), allow same-bar SL/TP hits ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)
                 if ot is not None:
                     long_side = (ot["trade_type"] == "long")
-                    sl = float(ot["stop_loss"])
-                    tp = float(ot["take_profit"])
-                    entry = float(ot["entry_price"])
+                    sl = float(ot["stop_loss"]); tp = float(ot["take_profit"]); entry = float(ot["entry_price"])
 
                     hit_sl = (next_low <= sl) if long_side else (next_high >= sl)
                     hit_tp = (next_high >= tp) if long_side else (next_low <= tp)
 
-                    # If both levels are inside the next bar, decide by proximity to next_open (proxy for first touch)
                     if hit_sl and hit_tp:
                         sl_dist = abs(next_open - sl)
                         tp_dist = abs(next_open - tp)
                         prefer_sl = sl_dist <= tp_dist
                         hit_sl, hit_tp = prefer_sl, (not prefer_sl)
 
-                    if hit_sl:
-                        exit_px = sl
-                        pnl = (sl - entry) if long_side else (entry - sl)
-                        stop_type = "sl"
-                        hit = True
-                    elif hit_tp:
-                        exit_px = tp
-                        pnl = (tp - entry) if long_side else (entry - tp)
-                        stop_type = "tp"
-                        hit = True
-                    else:
-                        hit = False
-
-                    if hit:
+                    if hit_sl or hit_tp:
+                        exit_px = sl if hit_sl else tp
+                        pnl = (exit_px - entry) if long_side else (entry - exit_px)
+                        stop_type = "sl" if hit_sl else "tp"
                         closed = dict(
                             **ot,
                             exit_price=exit_px,
@@ -819,6 +824,7 @@ class LongBacktestEnv(gym.Env):
                         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                         info["closed_trades"].append(closed)
                         trade_executed = True
+
 
             self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
             info["symbols"][sym] = {
@@ -886,11 +892,12 @@ class LongBacktestEnv(gym.Env):
         info["illegal_attempts"] = int(any_illegal_attempt)
         info["since_last_trade"] = float(global_since_last_trade)
         # ──────────────────────────────────────────────────────────────────────────────
-
-
         # keep your existing illegal-action penalties
         if any_illegal_attempt:
             reward += ILLEGAL_ATTEMPT_PENALTY
+
+        # also add the severe penalty you accumulated
+        reward += float(illegal_penalty_total)
 
         # final clip AFTER penalties, same as 1-min
         final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
@@ -914,6 +921,7 @@ class LongBacktestEnv(gym.Env):
 
     def _open_trade(self, sym: str, direction: str, entry: float, sl: float, tp: float):
         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]  # ensure at most one
+        risk_at_open = abs(float(entry) - float(sl))
         trade = dict(
             symbol=sym,
             trade_type=direction,
@@ -922,6 +930,7 @@ class LongBacktestEnv(gym.Env):
             take_profit=float(tp),
             volume=1.0,
             open_step=self.current_step,
+            risk_at_open=float(risk_at_open),
         )
         self.open_trades.append(trade)
         # Pay costs upfront
