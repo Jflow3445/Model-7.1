@@ -113,9 +113,11 @@ class TransformerBlock(nn.Module):
         orthogonal_init(self.attn); orthogonal_init(self.ff[0]); orthogonal_init(self.ff[-1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a, _ = self.attn(x, x, x)
-        x = self.ln1(x + self.drop(a))
-        f = self.ff(x)
+        # Run attention in fp32 to avoid BF16/FP32 matmul mismatch under AMP
+        with torch.cuda.amp.autocast(enabled=False):
+            a, _ = self.attn(x.float(), x.float(), x.float())
+        x = self.ln1(x + self.drop(a.to(dtype=x.dtype)))
+        f = self.ff(x)  # stays under the outer AMP context
         return self.ln2(x + self.drop(f))
 
 class CrossAssetAttention(nn.Module):
@@ -126,8 +128,10 @@ class CrossAssetAttention(nn.Module):
         orthogonal_init(self.attn)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y, _ = self.attn(x, x, x)
-        return self.ln(x + y)
+        # Same: keep MHA in fp32, then cast back
+        with torch.cuda.amp.autocast(enabled=False):
+            y, _ = self.attn(x.float(), x.float(), x.float())
+        return self.ln(x + y.to(dtype=x.dtype))
 
 class AttnPool1D(nn.Module):
     def __init__(self, embed_dim: int):
