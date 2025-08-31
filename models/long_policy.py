@@ -113,12 +113,26 @@ class TransformerBlock(nn.Module):
         orthogonal_init(self.attn); orthogonal_init(self.ff[0]); orthogonal_init(self.ff[-1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Run attention in fp32 to avoid BF16/FP32 matmul mismatch under AMP
+        dtype_in = x.dtype
+
+        # MHA in fp32
         with torch.cuda.amp.autocast(enabled=False):
             a, _ = self.attn(x.float(), x.float(), x.float())
-        x = self.ln1(x + self.drop(a.to(dtype=x.dtype)))
-        f = self.ff(x)  # stays under the outer AMP context
-        return self.ln2(x + self.drop(f))
+        x = x + self.drop(a.to(dtype_in))
+
+        # LN1 in fp32 → cast back
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.ln1(x.float()).to(dtype_in)
+
+        # FFN can stay under outer AMP (bf16)
+        f = self.ff(x)
+        x = x + self.drop(f)
+
+        # LN2 in fp32 → cast back
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self.ln2(x.float()).to(dtype_in)
+
+        return x
 
 class CrossAssetAttention(nn.Module):
     def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.08):
@@ -128,10 +142,12 @@ class CrossAssetAttention(nn.Module):
         orthogonal_init(self.attn)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Same: keep MHA in fp32, then cast back
+        dtype_in = x.dtype
+        # MHA in fp32
         with torch.cuda.amp.autocast(enabled=False):
             y, _ = self.attn(x.float(), x.float(), x.float())
-        return self.ln(x + y.to(dtype=x.dtype))
+            out = self.ln((x + y).float())  # LN in fp32 too
+        return out.to(dtype_in)
 
 class AttnPool1D(nn.Module):
     def __init__(self, embed_dim: int):
@@ -251,7 +267,10 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
         seq = self.blocks(seq)                                  # [B*N, W, E]
 
-        seq = self.final_ln(seq)
+        dtype_in = seq.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            seq = self.final_ln(seq.float()).to(dtype_in)
+
         y = seq.reshape(B, self.n_assets, self.window, self.embed_dim)
 
         # Attention pool over TIME per asset
