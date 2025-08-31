@@ -853,7 +853,7 @@ def train_long_policy(
     env_fns = [make_long_env(i, SEED, window) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
-    n_steps = 2048
+    n_steps = 1024
     rollout = n_steps * n_envs
     for cand in (1024, 512, 256, 128, 64):
         if rollout % cand == 0:
