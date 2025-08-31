@@ -849,8 +849,8 @@ def train_medium_policy(
     env_fns = [make_medium_env(i, SEED, window) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
-    n_steps = 1024
-    batch_size = 512
+    n_steps = 2048
+    batch_size = 8192
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
@@ -924,7 +924,6 @@ def train_medium_policy(
         callbacks.insert(0, checkpoint_callback)
     else:
         print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
-    # ── Train & save (same pattern as onemin) ────────────────────────────────
     try:
         if timesteps_left > 0:
             model.learn(

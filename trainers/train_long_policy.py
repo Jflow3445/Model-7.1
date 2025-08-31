@@ -853,8 +853,8 @@ def train_long_policy(
     env_fns = [make_long_env(i, SEED, window) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
-    n_steps = 1024
-    batch_size = 512
+    n_steps = 2048
+    batch_size = 8192
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
     algo_cls = PPO
