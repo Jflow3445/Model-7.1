@@ -117,24 +117,22 @@ class TransformerBlock(nn.Module):
         orthogonal_init(self.attn); orthogonal_init(self.ff[0]); orthogonal_init(self.ff[-1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype_in = x.dtype  # typically bfloat16 under AMP
+        # Keep the incoming dtype for the return path (usually bf16 under AMP)
+        dtype_in = x.dtype
 
-        # ── MultiheadAttention under current AMP (bf16) to save memory
-        a, _ = self.attn(x, x, x, need_weights=False)   # no big attn weights
-        x = x + self.drop(a)
+        # ── MHA: force bf16 autocast locally so params + inputs match at matmul time
+        # This avoids "BFloat16 != float" even if upstream autocast is off.
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+            a, _ = self.attn(x, x, x, need_weights=False)  # no weights to save memory
+        x = x + self.drop(a)  # still bf16 here
 
-        # ── LN1 in fp32, cast back
+        # ── LN + FFN in fp32 for stability; cast back to the original dtype
         with torch.cuda.amp.autocast(enabled=False):
-            x = self.ln1(x.float()).to(dtype_in)
-
-        # ── FFN in fp32, cast back (prevents dtype mismatch in Linear)
-        with torch.cuda.amp.autocast(enabled=False):
-            f = self.ff(x.float())
-        x = x + self.drop(f.to(dtype_in))
-
-        # ── LN2 in fp32, cast back
-        with torch.cuda.amp.autocast(enabled=False):
-            x = self.ln2(x.float()).to(dtype_in)
+            x = self.ln1(x.float())
+            f = self.ff(x)            # fp32 matmuls (no dtype clash)
+            x = x + self.drop(f)      # still fp32
+            x = self.ln2(x)           # fp32
+            x = x.to(dtype_in)        # back to bf16 for downstream
 
         return x
 
