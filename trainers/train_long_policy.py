@@ -263,9 +263,9 @@ class EarlyStoppingCallback(EventCallback):
         self.verbose = verbose
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.check_freq != 0:
+        # Trigger on exact timesteps so it lines up with checkpoint_freq etc.
+        if int(self.model.num_timesteps) % self.check_freq != 0:
             return True
-
         results = []
         for i in range(self.training_env.num_envs):
             monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
@@ -295,6 +295,56 @@ class EarlyStoppingCallback(EventCallback):
                     print("[EarlyStopping] Patience exceeded → stopping training.")
                 return False
         return True
+
+class LogRewardComponentsCallback(BaseCallback):
+    """
+    Aggregate env.info[] keys across the last rollout and push them into the SB3 logger
+    so they show up in the progress table.
+    """
+    def __init__(self, keys=None, section: str = "rollout", verbose: int = 0):
+        super().__init__(verbose)
+        self.section = section
+        self.keys = keys or [
+            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
+            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+            "rw_total_before_clip",
+            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+        ]
+        self._sums = {}
+        self._counts = {}
+
+    def _on_rollout_start(self) -> None:
+        self._sums = {k: 0.0 for k in self.keys}
+        self._counts = {k: 0 for k in self.keys}
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos")
+        if not infos:
+            return True
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            for k in self.keys:
+                v = info.get(k, None)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    self._sums[k] += fv
+                    self._counts[k] += 1
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # Record means so they appear in the console table
+        for k in self.keys:
+            c = self._counts.get(k, 0)
+            if c > 0:
+                mean = self._sums[k] / c
+                self.model.logger.record(f"{self.section}/{k}", mean)
+        # PPO will call logger.dump() itself after this, so no need to dump here.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Environment (daily) — fixed indexing + ATR handling
@@ -926,7 +976,17 @@ def train_long_policy(
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("train_long_policy")
     logger.info("Starting Long-term training with PPO and event-based reward.")
-
+    # Clean stale monitor files so new rw_* columns are written in the header
+    try:
+        for i in range(n_envs):
+            _log_dir = os.path.join(LOGS_DIR, f"long_worker_{i}")
+            os.makedirs(_log_dir, exist_ok=True)
+            mon_csv = os.path.join(_log_dir, "monitor.csv")
+            if os.path.exists(mon_csv):
+                os.remove(mon_csv)
+                print(f"[Monitor] Removed stale {mon_csv} to refresh headers.")
+    except Exception as e:
+        print(f"[Monitor] Cleanup skipped: {e}")
     # VecEnv
     env_fns = [make_long_env(i, SEED, window) for i in range(n_envs)]
     base_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
@@ -1006,7 +1066,7 @@ def train_long_policy(
 
     best_model_callback = SaveBestModelCallback(
         save_path=os.path.join(ckpt_dir, "long_policy_best.zip"),
-        check_freq=checkpoint_freq,
+        check_freq=n_steps * n_envs,
         rclone_dest=rclone_dest, 
         verbose=1,
     )
@@ -1015,8 +1075,8 @@ def train_long_policy(
         patience=patience,
         verbose=1,
     )
-
-    callbacks = [best_model_callback, early_stopping_callback]
+    comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)
+    callbacks = [comp_logger_callback, best_model_callback, early_stopping_callback]
     if rclone_dest:
         checkpoint_callback = CheckpointAndRcloneCallback(
             checkpoint_freq=checkpoint_freq,
