@@ -259,20 +259,25 @@ class RewardFunction(nn.Module):
                     gross_loss_step += -pnl_eff  # absolute
         realized_R_sum = float(sum(realized_r_list)) if realized_r_list else 0.0
 
-        # --- EMA quality in [-1,1] (bounded profit factor proxy) ---
-        # EMA update
+       # --- C2: EMA quality (bounded) — use DELTA so no per-step bleed when idle ---
         with torch.no_grad():
             gp_prev = float(self.ema_gross_profit.item())
             gl_prev = float(self.ema_gross_loss.item())
+            prev_q  = (gp_prev - gl_prev) / (gp_prev + gl_prev + eps)
+
             gp_new = (1.0 - self.stats_alpha) * gp_prev + self.stats_alpha * gross_profit_step
             gl_new = (1.0 - self.stats_alpha) * gl_prev + self.stats_alpha * gross_loss_step
+
             self.ema_gross_profit.copy_(torch.tensor(gp_new, dtype=torch.float32, device=device))
             self.ema_gross_loss.copy_(torch.tensor(gl_new, dtype=torch.float32, device=device))
 
-        # bounded quality score ∈ [-1, 1]
-        gp = float(self.ema_gross_profit.item())
-        gl = float(self.ema_gross_loss.item())
-        quality = (gp - gl) / (gp + gl + eps)
+            new_q = (gp_new - gl_new) / (gp_new + gl_new + eps)
+            quality_delta = new_q - prev_q
+
+        # Only pay the quality signal on steps that closed trades
+        if not closed_trades:
+            quality_delta = 0.0
+
 
         # --- C3: unrealized normalized by balance (optional, small weight) ---
         unreal_norm = float(unrealized_pnl) / max(self.initial_balance, eps)
@@ -350,7 +355,7 @@ class RewardFunction(nn.Module):
             return x
 
         C1 = _clip(self.realized_R_weight * realized_R_sum)
-        C2 = _clip(self.quality_weight * quality)
+        C2 = _clip(self.quality_weight * quality_delta)
         C3 = _clip(self.unrealized_weight * unreal_norm)
         C4 = _clip(inactivity_pen)
         C5 = _clip(holding_pen_total)
