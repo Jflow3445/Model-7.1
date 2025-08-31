@@ -854,6 +854,12 @@ def train_long_policy(
     vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
     n_steps = 2048
+    rollout = n_steps * n_envs
+    for cand in (1024, 512, 256, 128, 64):
+        if rollout % cand == 0:
+            batch_size = cand
+            break
+    print(f"[train_long] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
     batch_size = 2048
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
