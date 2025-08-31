@@ -881,10 +881,10 @@ def train_long_policy(
     )
     policy_kwargs = dict(
     window=window,
-    embed_dim=64,
-    tcn_hidden=64,
-    n_heads=4,
-    n_layers=2,
+    embed_dim=128,
+    tcn_hidden=128,
+    n_heads= 8,
+    n_layers= 4,
     )
 
     os.makedirs(MODELS_DIR, exist_ok=True)
