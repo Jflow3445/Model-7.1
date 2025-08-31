@@ -277,41 +277,34 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         fused.add_(t)
         # Transformer over TIME per asset (memory-safe): L = window, not assets*window
         seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
-       # Memory-guard: if B*N is large, split across batch to cap attn memory
+
+        # ── Adaptive row chunking across the whole stack (robust against OOM)
         BN, L, E = seq.shape
-        H = self.blocks[0].attn.num_heads if len(self.blocks) > 0 else 1
-        dtype_bytes = 2 if seq.dtype in (torch.float16, torch.bfloat16) else 4
+        bytes_per = 2 if seq.dtype in (torch.float16, torch.bfloat16) else 4
+        max_rows_cap = int(os.environ.get("LONG_MAX_ROWS", "2048"))  # upper bound you can tune
 
-        # Rough upper bound for attention intermediates (no weights returned):
-        approx_bytes = BN * H * L * L * dtype_bytes
-        MAX_BYTES = 1_200_000_000  # ~1.2 GB per forward chunk
+        def _adaptive_rows():
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info()
+            except Exception:
+                # Fallback if mem_get_info is unavailable
+                return max_rows_cap
+            # Safety factor (~16) to cover FFN/MHA workspaces + activations
+            denom = max(1, L * E * bytes_per * 16)
+            rows = int((free_bytes * 0.80) // denom)  # keep 20% headroom
+            return max(64, min(max_rows_cap, rows))
 
-        if approx_bytes > MAX_BYTES:
-            chunks = int(math.ceil(approx_bytes / MAX_BYTES))
-            parts = []
-            for xi in seq.chunk(chunks, dim=0):
-                parts.append(self.blocks(xi))
-            seq = torch.cat(parts, dim=0)
-        else:
-            # Run each TransformerBlock with token-aware chunking (caps FFN memory), with optional checkpointing.
-            h = seq
-            L = h.size(1)
-            max_tokens = max(8_000, int(self.max_tokens_per_chunk))  # floor for safety
+        parts = []
+        start = 0
+        while start < BN:
+            rows = _adaptive_rows()
+            end = min(BN, start + rows)
+            xi = seq[start:end]
+            yi = self.blocks(xi)  # run all transformer layers on this chunk
+            parts.append(yi)
+            start = end
+        seq = torch.cat(parts, dim=0)  # [B*N, W, E]
 
-            for blk in self.blocks:
-                BN = h.size(0)
-                tokens = BN * L
-                if tokens > max_tokens:
-                    chunks = int(math.ceil(tokens / max_tokens))
-                    parts = []
-                    for xi in h.chunk(chunks, dim=0):
-                        yi = checkpoint(blk, xi) if (self.use_checkpoint and self.training) else blk(xi)
-                        parts.append(yi)
-                    h = torch.cat(parts, dim=0)
-                else:
-                    h = checkpoint(blk, h) if (self.use_checkpoint and self.training) else blk(h)
-
-            seq = h  # [B*N, W, E]
 
         dtype_in = seq.dtype
         with torch.cuda.amp.autocast(enabled=False):
