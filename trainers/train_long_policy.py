@@ -349,23 +349,30 @@ class LongBacktestEnv(gym.Env):
         risk_budget = max(6.0, 0.75 * self.n_assets)
 
         self.reward_fn = RewardFunction(
-        initial_balance=self.initial_balance,
-        slippage_per_unit=SLIPPAGE_PER_UNIT,
-        commission_per_trade=0.0, 
-        integrate_costs_in_reward=True,
-        commission_per_trade=0.0,
-        inactivity_weight=0.00005,
-        inactivity_grace_steps=60,
-        holding_threshold_steps=80,
-        holding_penalty_per_step=0.0002,
-        realized_R_weight=1.5,
-        risk_budget_R=risk_budget,
-        overexposure_weight=0.015,
-        unrealized_weight=0.03,
-        component_clip=3.0,
-        final_clip=5.0,
-        integrate_costs_in_reward=True,
+            initial_balance=self.initial_balance,
+            slippage_per_unit=SLIPPAGE_PER_UNIT,
+            commission_per_trade=COMMISSION_PER_TRADE,   # use settings value
+            integrate_costs_in_reward=True,              # costs only in reward
+
+            # time pressure ↓ and only when flat
+            inactivity_weight=0.00005,
+            inactivity_grace_steps=60,
+
+            # holding penalty gentler
+            holding_threshold_steps=80,
+            holding_penalty_per_step=0.0002,
+
+            # stronger realized-R signal
+            realized_R_weight=1.5,
+
+            risk_budget_R=risk_budget,
+            overexposure_weight=0.015,
+            unrealized_weight=0.03,
+
+            component_clip=3.0,
+            final_clip=5.0,
         )
+
 
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
