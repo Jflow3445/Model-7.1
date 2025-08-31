@@ -305,11 +305,14 @@ class LogRewardComponentsCallback(BaseCallback):
         super().__init__(verbose)
         self.section = section
         self.keys = keys or [
-            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
-            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
-            "rw_total_before_clip",
-            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+        "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
+        "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+        "rw_realized_R_mean",              # NEW
+        "rw_total_before_clip",
+        "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+        "c_sl", "c_tp", "c_manual",        # NEW
         ]
+
         self._sums = {}
         self._counts = {}
 
@@ -813,7 +816,7 @@ class LongBacktestEnv(gym.Env):
             }
 
         # === Event-based reward: only when trades close ===
-        global_since_last_trade = float(np.min(self.last_trade_time)) if len(self.last_trade_time) else 0.0
+        global_since_last_trade = float(np.mean(self.last_trade_time)) if len(self.last_trade_time) else 0.0
 
         # include holding_time for open trades so C5 works
         open_trades_for_reward = []
@@ -847,13 +850,20 @@ class LongBacktestEnv(gym.Env):
         ).item())
 
         info["reward_components"] = getattr(self.reward_fn, "last_components", None)
+        # Stop-type counts for this step
+        info["c_sl"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "sl")
+        info["c_tp"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "tp")
+        info["c_manual"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "manual")
+
         # ── Diagnostics to log via Monitor (flatten keys) ─────────────────────────────
         rc = getattr(self.reward_fn, "last_components", {}) or {}
         for k in (
-            "C1_realizedR", "C2_quality", "C3_unreal", "C4_inactivity",
-            "C5_holding", "C6_overexp", "C7_conflict", "C8_churnSLTP",
-            "total_before_clip",
+        "C1_realizedR", "C2_quality", "C3_unreal", "C4_inactivity",
+        "C5_holding", "C6_overexp", "C7_conflict", "C8_churnSLTP",
+        "realized_R_mean",  # NEW: per-step mean R of closes
+        "total_before_clip",
         ):
+
             v = rc.get(k, None)
             if v is not None:
                 info[f"rw_{k}"] = float(v)
@@ -935,9 +945,12 @@ def make_long_env(rank: int, seed: int, window: int, symbols=None) -> Callable[[
             "n_open", "n_closed", "illegal_attempts", "since_last_trade",
             "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
             "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+            "rw_realized_R_mean",              # NEW
             "rw_total_before_clip",
-         ),
-         )
+            "c_sl", "c_tp", "c_manual",        # NEW
+             ),
+             )
+
 
         return env
     return _init

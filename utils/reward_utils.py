@@ -258,6 +258,9 @@ class RewardFunction(nn.Module):
                 elif pnl_eff < 0:
                     gross_loss_step += -pnl_eff  # absolute
         realized_R_sum = float(sum(realized_r_list)) if realized_r_list else 0.0
+        closed_count = len(realized_r_list)
+        realized_R_mean = (sum(realized_r_list) / closed_count) if closed_count > 0 else 0.0
+
 
        # --- C2: EMA quality (bounded) — use DELTA so no per-step bleed when idle ---
         with torch.no_grad():
@@ -370,18 +373,18 @@ class RewardFunction(nn.Module):
         total = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8
         # Expose component breakdown (pre-final-clip) for logging/debug
         self.last_components = {
-            "C1_realizedR": float(C1),
-            "C2_quality": float(C2),
-            "C3_unreal": float(C3),
-            "C4_inactivity": float(C4),
-            "C5_holding": float(C5),
-            "C6_overexp": float(C6),
-            "C7_conflict": float(C7),
-            "C8_churnSLTP": float(C8),
-            "total_before_clip": float(total),
-        }
-
-
+        "C1_realizedR": float(C1),
+        "C2_quality": float(C2),
+        "C3_unreal": float(C3),
+        "C4_inactivity": float(C4),
+        "C5_holding": float(C5),
+        "C6_overexp": float(C6),
+        "C7_conflict": float(C7),
+        "C8_churnSLTP": float(C8),
+        "realized_R_mean": float(realized_R_mean),  # NEW
+        "closed_count": float(closed_count),        # (optional—already have n_closed in env)
+        "total_before_clip": float(total),
+         }
         # Optional final clamp (wider than ±1 to keep gradients alive)
         if self.final_clip is not None and self.final_clip > 0:
             total = max(-self.final_clip, min(self.final_clip, total))
