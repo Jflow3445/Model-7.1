@@ -235,18 +235,17 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
 
             # Fuse + positions
             # Fuse + positions (avoid big temporaries)
-            fused = tok + x_cnn
-            a = self.asset_pos(self.asset_idx).view(1, self.n_assets, 1, self.embed_dim)
-            t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
-            # match AMP dtype so in-place works without extra casts
-            a = a.to(dtype=fused.dtype)
-            t = t.to(dtype=fused.dtype)
-            fused.add_(a)
-            fused.add_(t)
-            # Transformer over TIME per asset (memory-safe): L = window, not assets*window
-            seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
-            seq = self.blocks(seq)                                  # [B*N, W, E]
-
+        fused = tok + x_cnn
+        a = self.asset_pos(self.asset_idx).view(1, self.n_assets, 1, self.embed_dim)
+        t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
+        # match AMP device & dtype so in-place works without extra casts
+        a = a.to(device=fused.device, dtype=fused.dtype)
+        t = t.to(device=fused.device, dtype=fused.dtype)
+        fused.add_(a)
+        fused.add_(t)
+        # Transformer over TIME per asset (memory-safe): L = window, not assets*window
+        seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
+        seq = self.blocks(seq)                                  # [B*N, W, E]
 
         seq = self.final_ln(seq)
         y = seq.reshape(B, self.n_assets, self.window, self.embed_dim)
@@ -259,7 +258,6 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         # Cross-asset attention (short sequence length = N assets)
         y = self.cross(y)
         y = self.final_drop(y)                        # [B,N,E]
-        bars = bars.detach()
 
         # ── Extras: window-level OHLC features (24 -> project to 5 per asset) ────────
         # Compute stats without tracking grads to save a LOT of memory

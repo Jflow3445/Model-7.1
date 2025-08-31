@@ -878,7 +878,13 @@ def train_long_policy(
         tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
         device="cuda",
     )
-    policy_kwargs = dict(window=window)
+    policy_kwargs = dict(
+    window=window,
+    embed_dim=32,
+    tcn_hidden=32,
+    n_heads=2,
+    n_layers=1,
+    )
 
     os.makedirs(MODELS_DIR, exist_ok=True)
     ckpt_dir = os.path.join(MODELS_DIR, "checkpoints_long")
