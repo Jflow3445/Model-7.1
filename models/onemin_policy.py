@@ -197,40 +197,27 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         obs = obs.reshape(B, self.n_assets, self.per_asset)
         bars = obs[:, :, : 4 * self.window].reshape(B, self.n_assets, self.window, 4)
 
-        # Token path
-        tok = self.token(self.in_ln(bars))  # [B,N,W,E]
-
-       # DS-TCN path (micro-batched to avoid cuDNN 32-bit index overflow)
-        BN = B * self.n_assets
-        x_in = bars.permute(0, 1, 3, 2).contiguous().reshape(BN, 4, self.window)  # [BN,4,W]
-
-        # Process in chunks along BN
-        CHUNK = 32768  # safe upper bound; adjust smaller if needed
-        parts = []
-        for s in range(0, BN, CHUNK):
-            xi = x_in[s:s + CHUNK].contiguous()
-            xi = self.tcn1(xi)
-            xi = self.tcn2(xi)
-            xi = self.tcn3(xi)
-            xi = self.se(xi)
-            parts.append(xi)
-
-        x_cnn = torch.cat(parts, dim=0)  # [BN,E,W]
-        x_cnn = x_cnn.permute(0, 2, 1).reshape(B, self.n_assets, self.window, self.embed_dim)
-
-
-        # Fuse + positions
-        fused = tok + x_cnn
-        a = self.asset_pos(self.asset_idx).view(1, self.n_assets, 1, self.embed_dim)
-        t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
-        fused = fused + a + t
-
-        # Transformer over TIME per asset (memory-safe): L = window, not assets*window
-        seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
-
         use_amp = torch.cuda.is_available()
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-            seq = self.blocks(seq)                    # [B*N, W, E]
+            # Token path
+            tok = self.token(self.in_ln(bars))  # [B,N,W,E]
+
+            # DS-TCN path on channels-first then back
+            x_cnn = bars.permute(0, 1, 3, 2).contiguous()         # [B,N,4,W]
+            x_cnn = x_cnn.reshape(B * self.n_assets, 4, self.window)
+            x_cnn = self.tcn3(self.tcn2(self.tcn1(x_cnn)))        # [B*N,E,W]
+            x_cnn = self.se(x_cnn)
+            x_cnn = x_cnn.permute(0, 2, 1).reshape(B, self.n_assets, self.window, self.embed_dim)
+
+            # Fuse + positions
+            fused = tok + x_cnn
+            a = self.asset_pos(self.asset_idx).view(1, self.n_assets, 1, self.embed_dim)
+            t = self.time_pos(self.time_idx).view(1, 1, self.window, self.embed_dim)
+            fused = fused + a + t
+
+            # Transformer over TIME per asset (memory-safe): L = window, not assets*window
+            seq = fused.reshape(B * self.n_assets, self.window, self.embed_dim)
+            seq = self.blocks(seq)                                  # [B*N, W, E]
 
         seq = self.final_ln(seq)
         y = seq.reshape(B, self.n_assets, self.window, self.embed_dim)
