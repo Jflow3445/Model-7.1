@@ -895,6 +895,10 @@ class LongBacktestEnv(gym.Env):
             unrealized_pnl=float(unrealized_pnl),
             time_since_last_trade=global_since_last_trade
         ).item())
+        # ── NEW: never let reward be NaN/Inf
+        if not np.isfinite(reward):
+            reward = 0.0
+
 
         info["reward_components"] = getattr(self.reward_fn, "last_components", None)
         # Stop-type counts for this step
@@ -1093,19 +1097,21 @@ def train_long_policy(
     algo_cls = PPO
     policy_cls = LongTermOHLCPolicy
     algo_kwargs = dict(
-        n_steps=n_steps,
-        batch_size=batch_size,
-        learning_rate=2e-4,
-        gamma=0.995,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
-        device="cuda",
-        n_epochs=20,      
+    n_steps=n_steps,
+    batch_size=batch_size,
+    learning_rate=1e-4,        # ── NEW: smaller LR = fewer spikes
+    gamma=0.995,
+    gae_lambda=0.95,
+    clip_range=0.2,
+    ent_coef=0.01,
+    vf_coef=0.5,
+    max_grad_norm=0.5,
+    tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
+    device="cuda",
+    n_epochs=10,               # ── NEW: fewer epochs, less overfitting per batch
+    target_kl=0.2,             # ── NEW: early-stop updates if policy drifts too far
     )
+
     policy_kwargs = dict(
     window=window,
     embed_dim=128,

@@ -20,8 +20,11 @@ try:
         pass
 except Exception:
     pass
-
-
+torch.backends.cuda.matmul.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 logger = logging.getLogger("LongPolicy")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -244,6 +247,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
 
         # Keep output projection shape identical for head compatibility
         self.out_proj = nn.Linear(self._features_dim, self._features_dim)
+        orthogonal_init(self.out_proj, gain=0.10)
 
         self.register_buffer("asset_idx", torch.arange(n_assets))
         self.register_buffer("time_idx", torch.arange(window))
@@ -430,6 +434,11 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         # Concatenate pooled transformer features with extras
         y_flat = y.reshape(B, -1)                       # [B, N*E]
         feats = torch.cat([y_flat, extras], dim=1)      # [B, N*(E + 5)]
+
+        # ── NEW: sanitize & bound features to keep matmuls stable
+        feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        feats = feats.clamp_(-50.0, 50.0)
+
         out = self.out_proj(feats)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -465,6 +474,7 @@ class HybridActionDistribution(Distribution):
         cont_mean    = torch.nan_to_num(cont_mean, nan=0.0, posinf=1e6, neginf=-1e6)
         cont_log_std = torch.clamp(cont_log_std, min=-5.0, max=2.0)
         self.cont_dist = self.cont_dist.proba_distribution(cont_mean, cont_log_std)
+        disc_logits = torch.clamp(disc_logits, -60.0, 60.0)
         return self
     def proba_distribution_net(self, *args, **kwargs):
         """
@@ -499,7 +509,9 @@ class HybridActionDistribution(Distribution):
         idx = disc.argmax(dim=2)
         cat_lp = self._cat().log_prob(idx).sum(dim=1)
         cont_lp = self.cont_dist.log_prob(cont)
-        return cat_lp + cont_lp
+        lp = cat_lp + cont_lp
+        return torch.nan_to_num(lp, nan=-1e6, posinf=-1e6, neginf=-1e6)
+
 
     def entropy(self) -> torch.Tensor:
         disc_H = self._cat().entropy().sum(dim=1)
@@ -507,7 +519,8 @@ class HybridActionDistribution(Distribution):
         cont_H = self.cont_dist.entropy()
         if isinstance(cont_H, torch.Tensor):
             # Unsquashed Gaussian path (DiagGaussian) → already a tensor
-            return disc_H + cont_H
+            return torch.nan_to_num(disc_H + cont_H, nan=0.0, posinf=0.0, neginf=0.0)
+
 
         # Squashed Gaussian path: SB3 returns None. Try to approximate using log_std.
         log_std = getattr(self.cont_dist, "log_std", None)
@@ -650,8 +663,14 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         value = self.value_net(latent_vf)
         actions = dist.get_actions(deterministic=deterministic)
         log_prob = dist.log_prob(actions)
+
+        # ── NEW: sanitize what PPO consumes
+        value    = torch.nan_to_num(value,    nan=0.0, posinf=0.0, neginf=0.0)
+        log_prob = torch.nan_to_num(log_prob, nan=-1e6, posinf=-1e6, neginf=-1e6)
+
         self._last_regime_logits = torch.nan_to_num(self.regime_classifier(features), nan=0.0, posinf=0.0, neginf=0.0)
         return actions, value, log_prob
+
     
     def evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor):
         # SB3 calls this during PPO updates; we pass features so temp_head is used
@@ -661,8 +680,14 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
 
         dist = self._get_action_dist_from_latent(latent_pi, features=features)
         log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
-        values = self.value_net(latent_vf)
+        entropy  = dist.entropy()
+        values   = self.value_net(latent_vf)
+
+        # ── NEW: sanitize before loss is computed
+        values   = torch.nan_to_num(values,   nan=0.0,  posinf=0.0,  neginf=0.0)
+        log_prob = torch.nan_to_num(log_prob, nan=-1e6, posinf=-1e6, neginf=-1e6)
+        entropy  = torch.nan_to_num(entropy,  nan=0.0,  posinf=0.0,  neginf=0.0)
+
         return values, log_prob, entropy
 
     def _predict(self, observation: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
