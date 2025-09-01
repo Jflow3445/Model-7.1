@@ -351,8 +351,11 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             o_t, h_t, l_t, c_t = open_[..., -1], high_[..., -1], low_[..., -1], close_[..., -1]
             o_p, h_p, l_p, c_p = open_[..., -2], high_[..., -2], low_[..., -2], close_[..., -2]
 
-            # Sequences
-            r_seq = torch.log((close_[..., 1:] + eps) / (close_[..., :-1] + eps))     # [B,N,W-1]
+            # Sequences (safe for log even if inputs were ever normalized)
+            close_next = close_[..., 1:].clamp_min(eps)
+            close_prev = close_[..., :-1].clamp_min(eps)
+            r_seq = torch.log(close_next / close_prev)                                  # [B,N,W-1]
+
             R_seq = (high_ - low_).abs()                                             # [B,N,W]
             R_t   = (h_t - l_t).abs()
             R_p   = (h_p - l_p).abs().clamp_min(eps)
@@ -426,10 +429,10 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             ], dim=-1)   # [B,N,24]
 
         # Project to 5 per asset; grads only flow into this linear
-        extras_24 = extras_24.to(fdtype)
+        extras_24 = torch.nan_to_num(extras_24, nan=0.0, posinf=0.0, neginf=0.0)
+        extras_24 = extras_24.clamp_(-50.0, 50.0).to(fdtype)
         extras_5 = self.extras_proj(extras_24)      # [B,N,5]
         extras   = extras_5.reshape(B, -1)          # [B, N*5]
-
 
         # Concatenate pooled transformer features with extras
         y_flat = y.reshape(B, -1)                       # [B, N*E]

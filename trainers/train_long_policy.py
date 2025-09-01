@@ -1075,7 +1075,7 @@ def train_long_policy(
 
     vec_env = VecNormalize(
         base_env,
-        norm_obs=True,
+        norm_obs=False,
         norm_reward=True,
         gamma=0.995,
         clip_obs=10.0,               # ── NEW: clip obs to keep them sane
