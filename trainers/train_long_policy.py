@@ -1045,7 +1045,7 @@ def train_long_policy(
         norm_obs=False,          # leave obs as-is (you already layernorm inside the net)
         norm_reward=True,        # <-- key
         gamma=0.995,
-        clip_reward=None,
+        clip_reward=float("inf"),
     )
     n_steps = 1024
     rollout = n_steps * n_envs

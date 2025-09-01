@@ -125,26 +125,24 @@ class TransformerBlock(nn.Module):
         orig_dtype = x.dtype  # usually bfloat16 under AMP
 
         # ── MHA under bf16 (saves memory); don't return weights
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda",enabled=True, dtype=torch.bfloat16):
             a, _ = self.attn(x, x, x, need_weights=False)
             x = x + self.drop(a)
 
         # ── LN1 in fp32 for stability
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda",enabled=False):
             x = self.ln1(x.float())
 
         # ── FFN in bf16 to slash activation memory
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda",enabled=True, dtype=torch.bfloat16):
             f = self.ff(x.to(torch.bfloat16))
             x = x + self.drop(f)
 
         # ── LN2 in fp32, then back to original dtype
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda",enabled=False):
             x = self.ln2(x.float()).to(orig_dtype)
 
         return x
-
-
 
 class CrossAssetAttention(nn.Module):
     def __init__(self, embed_dim: int, n_heads: int = 4, dropout: float = 0.08):
