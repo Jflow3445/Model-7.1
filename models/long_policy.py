@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+torch.autograd.set_detect_anomaly(True)
 from torch.utils.checkpoint import checkpoint
 from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -460,6 +461,9 @@ class HybridActionDistribution(Distribution):
             self._disc_logits = discrete_logits
         else:
             raise ValueError("discrete_logits must be [B, N*8] or [B, N, 8]")
+        # ── NEW: final safety before handing to SB3 Normal
+        cont_mean    = torch.nan_to_num(cont_mean, nan=0.0, posinf=1e6, neginf=-1e6)
+        cont_log_std = torch.clamp(cont_log_std, min=-5.0, max=2.0)
         self.cont_dist = self.cont_dist.proba_distribution(cont_mean, cont_log_std)
         return self
     def proba_distribution_net(self, *args, **kwargs):
@@ -633,8 +637,10 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         else:
             disc_logits = disc_logits / self.base_disc_temperature
 
+        # ── NEW: sanitize continuous head before creating the distribution
+        cont_mean    = torch.nan_to_num(cont_mean, nan=0.0, posinf=1e6, neginf=-1e6)
+        cont_log_std = torch.clamp(cont_log_std, min=-5.0, max=2.0)
         return self._hybrid.proba_distribution(disc_logits, cont_mean, cont_log_std)
-
 
     def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)

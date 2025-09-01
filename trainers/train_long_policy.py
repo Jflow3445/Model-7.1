@@ -192,9 +192,8 @@ class SaveBestModelCallback(BaseCallback):
         self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.check_freq != 0:
+        if int(self.model.num_timesteps) % int(self.check_freq) != 0:
             return True
-
         # Gather recent episodic returns
         results = []
         for i in range(self.training_env.num_envs):
@@ -310,12 +309,14 @@ class LogStdCallback(BaseCallback):
     def _on_step(self) -> bool:
         try:
             log_std = getattr(self.model.policy, "log_std", None)
+            if log_std is None:
+                dist = getattr(self.model.policy, "action_dist", None)
+                log_std = getattr(dist, "log_std", None) if dist is not None else None
             if log_std is not None:
                 self.model.logger.record("policy/std", float(log_std.exp().mean().item()))
         except Exception:
             pass
         return True
-
 
 class LogRewardComponentsCallback(BaseCallback):
     """
@@ -459,7 +460,7 @@ class LongBacktestEnv(gym.Env):
         inactivity_grace_steps=2,
 
         # holding penalty gentler
-        holding_threshold_steps=30,
+        holding_threshold_steps=5,
         holding_penalty_per_step=0.0006,
 
         # slightly lower so C1 less likely to clip after switching to mean
@@ -550,8 +551,11 @@ class LongBacktestEnv(gym.Env):
         self.reward_fn.reset()
 
         obs = self._get_observation(self.cursor)
+        # ── NEW: guard against NaN/Inf in observations
+        if not np.isfinite(obs).all():
+            bad = np.where(~np.isfinite(obs))[0][:10]
+            raise RuntimeError(f"NaN/Inf in reset observation at cursor={self.cursor}, first_bad_idxs={bad}")
         return obs.astype(np.float32), {}
-
     def _get_observation(self, idx: int) -> np.ndarray:
         obs_parts = []
         for i, sym in enumerate(self.symbols):
@@ -941,6 +945,11 @@ class LongBacktestEnv(gym.Env):
         else:
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
+        # ── NEW: guard against NaN/Inf in observations
+        if not np.isfinite(obs).all():
+            raise RuntimeError(
+                f"NaN/Inf in observation at step={self.current_step}, idx={self.cursor}, symbols={self.symbols}"
+            )
         return obs, float(reward), terminated, truncated, info
 
     def _open_trade(self, sym: str, direction: str, entry: float, sl: float, tp: float):
@@ -1052,17 +1061,23 @@ def train_long_policy(
     base_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
     pkl_path = os.path.join(MODELS_DIR, "checkpoints_long", "vecnormalize.pkl")
+    # ── NEW: force fresh stats to avoid NaNs from stale/mismatched running means/vars
     if os.path.exists(pkl_path):
-        vec_env = VecNormalize.load(pkl_path, base_env)
-        vec_env.training = True
-    else:
-        vec_env = VecNormalize(
-            base_env,
-            norm_obs=True,             # ← enable obs normalization
-            norm_reward=True,
-            gamma=0.995,
-            clip_reward=float("inf"),
-        )
+        try:
+            os.remove(pkl_path)
+            print(f"[VecNormalize] Deleted stale stats at {pkl_path}")
+        except Exception as e:
+            print(f"[VecNormalize] Could not delete {pkl_path}: {e}")
+
+    vec_env = VecNormalize(
+        base_env,
+        norm_obs=True,
+        norm_reward=True,
+        gamma=0.995,
+        clip_obs=10.0,               # ── NEW: clip obs to keep them sane
+        clip_reward=float("inf"),
+    )
+
 
     n_steps = 1024
     rollout = n_steps * n_envs
