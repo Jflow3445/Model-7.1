@@ -766,12 +766,23 @@ class LongBacktestEnv(gym.Env):
                         entry=ref_price, sl_norm=sl_norm, tp_norm=0.0,
                         is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
+                    # --- Adjust Stop-Loss (tighten-only) ---
                     floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                    old_sl = float(ot["stop_loss"])
+
                     if is_long:
-                        new_sl = min(new_sl, ot["take_profit"] - floor_price, ref_price - floor_price)
+                        # stop must stay below price but can only move UP (toward price)
+                        upper_bound = min(ot["take_profit"] - floor_price, ref_price - floor_price)
+                        candidate   = min(new_sl, upper_bound)   # respect floors/TP spacing
+                        new_sl      = max(old_sl, candidate)     # tighten-only: never below old_sl (no widening)
                     else:
-                        new_sl = max(new_sl, ot["take_profit"] + floor_price, ref_price + floor_price)
+                        # stop must stay above price but can only move DOWN (toward price)
+                        lower_bound = max(ot["take_profit"] + floor_price, ref_price + floor_price)
+                        candidate   = max(new_sl, lower_bound)
+                        new_sl      = min(old_sl, candidate)     # tighten-only: never above old_sl (no widening)
+
                     ot["stop_loss"] = float(new_sl)
+
                     info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
 
                 elif act_id == 6 and ot is not None:
