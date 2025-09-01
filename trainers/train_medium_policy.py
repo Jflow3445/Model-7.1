@@ -14,7 +14,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EventCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 import subprocess
 
@@ -181,9 +181,8 @@ class SaveBestModelCallback(BaseCallback):
         self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.check_freq != 0:
+        if int(self.model.num_timesteps) % self.check_freq != 0:
             return True
-
         results = []
         for i in range(self.training_env.num_envs):
             monitor_file = os.path.join(LOGS_DIR, f"medium_worker_{i}", "monitor.csv")
@@ -205,6 +204,13 @@ class SaveBestModelCallback(BaseCallback):
             fzip = self.save_path if self.save_path.endswith(".zip") else (self.save_path + ".zip")
             if self.verbose:
                 print(f"[SaveBestModel] New best → saved to {fzip}")
+            
+            # NEW: also persist VecNormalize stats when we get a new best
+            try:
+                if isinstance(self.training_env, VecNormalize):
+                    self.training_env.save(os.path.join(os.path.dirname(self.save_path), "vecnormalize.pkl"))
+            except Exception as e:
+                print(f"[VecNormalize] Save (best) failed: {e}")
 
             if self.rclone_dest:
                 try:
@@ -238,9 +244,8 @@ class EarlyStoppingCallback(EventCallback):
         self.verbose = verbose
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.check_freq != 0:
+        if int(self.model.num_timesteps) % self.check_freq != 0:
             return True
-
         results = []
         for i in range(self.training_env.num_envs):
             monitor_file = os.path.join(LOGS_DIR, f"medium_worker_{i}", "monitor.csv")
@@ -270,6 +275,54 @@ class EarlyStoppingCallback(EventCallback):
                     print("[EarlyStopping] Patience exceeded → stopping training.")
                 return False
         return True
+class LogRewardComponentsCallback(BaseCallback):
+    """
+    Aggregate env.info[] keys across the last rollout and push them into the SB3 logger
+    so they show up in the progress table.
+    """
+    def __init__(self, keys=None, section: str = "rollout", verbose: int = 0):
+        super().__init__(verbose)
+        self.section = section
+        self.keys = keys or [
+            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
+            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+            "rw_realized_R_mean", "rw_total_before_clip",
+            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+            "c_sl", "c_tp", "c_manual",
+        ]
+        self._sums = {}
+        self._counts = {}
+
+    def _on_rollout_start(self) -> None:
+        self._sums = {k: 0.0 for k in self.keys}
+        self._counts = {k: 0 for k in self.keys}
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos")
+        if not infos:
+            return True
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            for k in self.keys:
+                v = info.get(k, None)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    self._sums[k] += fv
+                    self._counts[k] += 1
+        return True
+
+    def _on_rollout_end(self) -> None:
+        for k in self.keys:
+            c = self._counts.get(k, 0)
+            if c > 0:
+                mean = self._sums[k] / c
+                self.model.logger.record(f"{self.section}/{k}", mean)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Environment (hourly) — fixed indexing + ATR handling
@@ -503,6 +556,8 @@ class MediumBacktestEnv(gym.Env):
         reward = 0.0
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
+        any_illegal_attempt = False 
+        c_sl = c_tp = c_manual = 0  
         for i, sym in enumerate(self.symbols):
             df = self.dfs[sym]
             act = action[i * 10: (i + 1) * 10]
@@ -557,7 +612,7 @@ class MediumBacktestEnv(gym.Env):
             attempted_illegal = not valid[orig_action]
             if attempted_illegal:
                 illegal_penalty_total += ILLEGAL_ATTEMPT_PENALTY
-
+                any_illegal_attempt = True
             # Use ONLY information available in the current observation:
             curr_idx   = idx - 1  # last bar included in the observation slice
             if curr_idx < 0:
@@ -730,8 +785,7 @@ class MediumBacktestEnv(gym.Env):
             }
 
         # === Event-based reward: only when trades close ===
-        global_since_last_trade = float(np.min(self.last_trade_time)) if len(self.last_trade_time) else 0.0
-
+        global_since_last_trade = float(np.mean(self.last_trade_time)) if len(self.last_trade_time) else 0.0
         # include holding_time for open trades so C5 works
         open_trades_for_reward = []
         for t in self.open_trades:
@@ -746,6 +800,36 @@ class MediumBacktestEnv(gym.Env):
             unrealized_pnl=0.0,
             time_since_last_trade=global_since_last_trade
         ).item())
+
+        # >>> ADD (just after reward is computed)
+
+        # Count stop types this step
+        for ct in info["closed_trades"]:
+            if ct.get("stop_type") == "sl":
+                c_sl += 1
+            elif ct.get("stop_type") == "tp":
+                c_tp += 1
+            elif ct.get("stop_type") == "manual":
+                c_manual += 1
+        info["c_sl"] = c_sl
+        info["c_tp"] = c_tp
+        info["c_manual"] = c_manual
+
+        # Flatten reward components
+        rc = getattr(self.reward_fn, "last_components", {}) or {}
+        for k in (
+            "C1_realizedR", "C2_quality", "C3_unreal", "C4_inactivity",
+            "C5_holding", "C6_overexp", "C7_conflict", "C8_churnSLTP",
+            "realized_R_mean", "total_before_clip",
+        ):
+            v = rc.get(k, None)
+            if v is not None:
+                info[f"rw_{k}"] = float(v)
+
+        info["n_open"] = int(len(self.open_trades))
+        info["n_closed"] = int(len(info["closed_trades"]))
+        info["illegal_attempts"] = int(any_illegal_attempt)
+        info["since_last_trade"] = float(global_since_last_trade)
 
         # keep your existing illegal-action penalties
         reward += illegal_penalty_total
@@ -806,7 +890,17 @@ def make_medium_env(rank: int, seed: int, window: int, symbols=None) -> Callable
         env.seed(seed + rank)
         log_dir = os.path.join(LOGS_DIR, f"medium_worker_{rank}")
         os.makedirs(log_dir, exist_ok=True)
-        env = Monitor(env, filename=os.path.join(log_dir, "monitor.csv"))
+        env = Monitor(
+        env,
+        filename=os.path.join(log_dir, "monitor.csv"),
+        info_keywords=(
+            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
+            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+            "rw_realized_R_mean", "rw_total_before_clip",
+            "c_sl", "c_tp", "c_manual",
+        ),
+    )
         return env
     return _init
 
@@ -845,9 +939,37 @@ def train_medium_policy(
     logger = logging.getLogger("train_medium_policy")
     logger.info("Starting medium-term training with PPO and event-based reward.")
 
+
+    # >>> ADD (before creating env_fns)
+    try:
+        for i in range(n_envs):
+            _log_dir = os.path.join(LOGS_DIR, f"medium_worker_{i}")
+            os.makedirs(_log_dir, exist_ok=True)
+            mon_csv = os.path.join(_log_dir, "monitor.csv")
+            if os.path.exists(mon_csv):
+                os.remove(mon_csv)
+                print(f"[Monitor] Removed stale {mon_csv} to refresh headers.")
+    except Exception as e:
+        print(f"[Monitor] Cleanup skipped: {e}")
+
     # VecEnv
     env_fns = [make_medium_env(i, SEED, window) for i in range(n_envs)]
-    vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
+    base_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
+
+    # (optional) load VecNormalize stats if resuming
+    pkl_path = os.path.join(MODELS_DIR, "checkpoints_medium", "vecnormalize.pkl")
+    if os.path.exists(pkl_path):
+        vec_env = VecNormalize.load(pkl_path, base_env)
+        vec_env.training = True
+    else:
+        vec_env = VecNormalize(
+            base_env,
+            norm_obs=False,
+            norm_reward=True,
+            gamma=0.995,
+            clip_reward=np.inf,
+        )
+
 
     n_steps = 2048
     rollout = n_steps * n_envs
@@ -855,7 +977,7 @@ def train_medium_policy(
         if rollout % cand == 0:
             batch_size = cand
             break
-    print(f"[train_long] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
+    print(f"[train_medium] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
     batch_size = 2048
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
@@ -907,19 +1029,21 @@ def train_medium_policy(
     # Build callback list (checkpoint only if RCLONE_DEST is set)
     rclone_dest = os.getenv("RCLONE_DEST")
 
-    best_model_callback = SaveBestModelCallback(
+    best_model_callback = SaveBestModelCallback(  # >>> REPLACE
         save_path=os.path.join(ckpt_dir, "medium_policy_best.zip"),
-        check_freq=checkpoint_freq,
+        check_freq=n_steps * n_envs,        # align to rollouts
         rclone_dest=rclone_dest,
         verbose=1,
     )
     early_stopping_callback = EarlyStoppingCallback(
-        check_freq=early_stopping_check_freq,
+        check_freq=early_stopping_check_freq,  # will key off model.num_timesteps now
         patience=patience,
         verbose=1,
     )
+    comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)  # >>> ADD
 
-    callbacks = [best_model_callback, early_stopping_callback]
+    callbacks = [comp_logger_callback, best_model_callback, early_stopping_callback]  # >>> REPLACE
+
     if rclone_dest:
         checkpoint_callback = CheckpointAndRcloneCallback(
             checkpoint_freq=checkpoint_freq,
@@ -937,8 +1061,17 @@ def train_medium_policy(
                 callback=callbacks,
                 reset_num_timesteps=False,
             )
+            # Save final model artifacts
             model.save(last_ckpt_path)
             model.save(main_save_path)
+
+            # Save VecNormalize running stats so resumes use identical reward scaling
+            try:
+                vec_env.save(os.path.join(ckpt_dir, "vecnormalize.pkl"))
+                print(f"[VecNormalize] Saved running stats -> {os.path.join(ckpt_dir, 'vecnormalize.pkl')}")
+            except Exception as e:
+                print(f"[VecNormalize] Could not save stats: {e}")
+
             logger.info(f"Training complete. Model saved to {main_save_path} and {last_ckpt_path}")
         else:
             logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")

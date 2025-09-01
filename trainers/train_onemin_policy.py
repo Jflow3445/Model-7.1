@@ -14,7 +14,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EventCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 import subprocess
 
@@ -147,6 +147,13 @@ class CheckpointAndRcloneCallback(BaseCallback):
         base = f"{self.name_prefix}_{t}_steps"
         fpath = os.path.join(self.ckpt_dir, base)
         self.model.save(fpath)
+        # also checkpoint VecNormalize stats
+        try:
+            if isinstance(self.training_env, VecNormalize):
+                self.training_env.save(os.path.join(self.ckpt_dir, "vecnormalize.pkl"))
+        except Exception as e:
+            print(f"[VecNormalize] Save (ckpt) failed: {e}")
+
         fzip = fpath + ".zip"
         exists = os.path.exists(fzip)
         print(f"[Checkpoint] wrote {fzip}  exists={exists}")
@@ -163,6 +170,20 @@ class CheckpointAndRcloneCallback(BaseCallback):
             try:
                 subprocess.run(cmd, check=True)
                 print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
+
+                # push vecnormalize.pkl too
+                pkl_path = os.path.join(self.ckpt_dir, "vecnormalize.pkl")
+                if os.path.exists(pkl_path):
+                    try:
+                        subprocess.run(
+                            ["rclone", "copy", pkl_path, self.rclone_dest,
+                            "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"],
+                            check=True
+                        )
+                        print(f"[VecNormalize] pushed vecnormalize.pkl -> {self.rclone_dest}")
+                    except subprocess.CalledProcessError:
+                        print("[VecNormalize] pkl upload failed.")
+
             except subprocess.CalledProcessError as e:
                 # If you prefer to continue training on upload failures, change this to a print().
                 print("[Checkpoint] Upload failure.")
@@ -191,7 +212,7 @@ class SaveBestModelCallback(BaseCallback):
             if os.path.exists(monitor_file):
                 df = pd.read_csv(monitor_file, skiprows=1)
                 if "r" in df.columns:
-                    results.extend(df["r"].values[-200:])  # last 200 episodic returns
+                    results.extend(df["r"].values[-200:])
 
         if not results:
             return True
@@ -202,27 +223,48 @@ class SaveBestModelCallback(BaseCallback):
 
         if mean_reward > self.best_mean_reward + 1e-4:
             self.best_mean_reward = mean_reward
-            # save
             self.model.save(self.save_path)
             fzip = self.save_path if self.save_path.endswith(".zip") else (self.save_path + ".zip")
             if self.verbose:
                 print(f"[SaveBestModel] New best → saved to {fzip}")
 
-            # optional upload
+            # persist VecNormalize stats
+            try:
+                if isinstance(self.training_env, VecNormalize):
+                    self.training_env.save(os.path.join(os.path.dirname(self.save_path), "vecnormalize.pkl"))
+            except Exception as e:
+                print(f"[VecNormalize] Save (best) failed: {e}")
+
+            # optional uploads
             if self.rclone_dest:
                 try:
-                    cmd = [
-                        "rclone", "copy", fzip, self.rclone_dest,
-                        "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
-                    ]
-                    subprocess.run(cmd, check=True)
+                    subprocess.run(
+                        ["rclone", "copy", fzip, self.rclone_dest,
+                        "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"],
+                        check=True
+                    )
                     if self.verbose:
                         print(f"[SaveBestModel] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
                 except FileNotFoundError:
                     print("[SaveBestModel] rclone not found on PATH; skipped upload.")
                 except subprocess.CalledProcessError as e:
                     print(f"[SaveBestModel] Upload failed: {e}. Training continues.")
+
+                # push vecnormalize.pkl too
+                pkl_path = os.path.join(os.path.dirname(fzip), "vecnormalize.pkl")
+                if os.path.exists(pkl_path):
+                    try:
+                        subprocess.run(
+                            ["rclone", "copy", pkl_path, self.rclone_dest,
+                            "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"],
+                            check=True
+                        )
+                        if self.verbose:
+                            print(f"[VecNormalize] pushed vecnormalize.pkl -> {self.rclone_dest}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"[VecNormalize] pkl upload failed: {e}")
         return True
+
 
 class _NoOpCallback(BaseCallback):
     def _on_step(self) -> bool:
@@ -849,9 +891,23 @@ def train_onemin_policy(
     logger = logging.getLogger("train_onemin_policy")
     logger.info("Starting onemin policy training with PPO and event-based reward.")
 
-    # VecEnv
+    # VecEnv (+ VecNormalize load/resume)
     env_fns = [make_onemin_env(i, SEED, window) for i in range(n_envs)]
-    vec_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
+    base_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
+
+    pkl_path = os.path.join(MODELS_DIR, "checkpoints_onemin", "vecnormalize.pkl")
+    if os.path.exists(pkl_path):
+        vec_env = VecNormalize.load(pkl_path, base_env)
+        vec_env.training = True
+    else:
+        vec_env = VecNormalize(
+            base_env,
+            norm_obs=False,
+            norm_reward=True,
+            gamma=0.995,
+            clip_reward=np.inf,
+        )
+
 
     n_steps = 2048
     rollout = n_steps * n_envs
@@ -859,10 +915,8 @@ def train_onemin_policy(
         if rollout % cand == 0:
             batch_size = cand
             break
-    print(f"[train_long] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
-    batch_size = 2048
+    print(f"[train_onemin] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
-
     algo_cls = PPO
     policy_cls = OneMinOHLCPolicy
     algo_kwargs = dict(
@@ -944,6 +998,12 @@ def train_onemin_policy(
             )
             model.save(last_ckpt_path)
             model.save(main_save_path)
+            # persist VecNormalize running stats for clean resumes
+            try:
+                vec_env.save(os.path.join(ckpt_dir, "vecnormalize.pkl"))
+                print(f"[VecNormalize] Saved running stats -> {os.path.join(ckpt_dir, 'vecnormalize.pkl')}")
+            except Exception as e:
+                print(f"[VecNormalize] Could not save stats: {e}")
             logger.info(f"Training complete. Model saved to {main_save_path} and {last_ckpt_path}")
         else:
             logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")
