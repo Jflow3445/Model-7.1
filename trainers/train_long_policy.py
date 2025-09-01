@@ -34,6 +34,7 @@ from config.settings import (
     INITIAL_BALANCE,
     LONG_OBS_WINDOW,
     BASE_DIR,
+    LOT_MULTIPLIER,
 )
 from utils.reward_utils import RewardFunction
 
@@ -437,6 +438,7 @@ class LongBacktestEnv(gym.Env):
         slippage_per_unit=SLIPPAGE_PER_UNIT,
         commission_per_trade=COMMISSION_PER_TRADE,
         integrate_costs_in_reward=True,
+        price_to_ccy_scale=LOT_MULTIPLIER,
 
         # NEW: safer R floor; adjust if your price scale differs
         min_risk=5e-4,

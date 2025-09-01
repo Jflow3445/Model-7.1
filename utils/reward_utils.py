@@ -1,5 +1,4 @@
 # utils/reward_utils.py
-
 from __future__ import annotations
 import logging
 from typing import Any, List, Dict, Optional, Union, Set, Tuple
@@ -7,7 +6,7 @@ from typing import Any, List, Dict, Optional, Union, Set, Tuple
 import torch
 import torch.nn as nn
 
-from config.settings import INITIAL_BALANCE, EPS
+from config.settings import INITIAL_BALANCE, EPS, LOT_MULTIPLIER
 
 logger = logging.getLogger("RewardFunction")
 logger.setLevel(logging.INFO)
@@ -95,14 +94,14 @@ class RewardFunction(nn.Module):
       - time_since_last_trade: expressed in **steps** (not seconds)
 
     Component summary (all bounded):
-      C1  realized_R_sum        (sum of clipped R for trades closed this step)
-      C2  quality_ema           ((EMA GP - EMA GL)/(EMA GP + EMA GL + eps)) in [-1,1]
-      C3  unrealized_norm       (unrealized_pnl / initial_balance) * unrealized_weight
-      C4  inactivity_penalty    (-inactivity_weight * max(0, steps_since_last - grace))
-      C5  holding_penalty       (-holding_penalty_per_step for each open trade beyond threshold steps)
-      C6  overexposure_penalty  (-overexposure_weight * max(0, (exposure_R - budget_R)))
-      C7  conflict_penalty      (-conflict_weight per symbol with both long and short open)
-      C8  churn_penalty         (-churn_weight if many tiny-R trades closed this step)
+      C1  realized_R_mean      (mean of clipped R for trades closed this step)
+      C2  quality_ema          ((EMA GP - EMA GL)/(EMA GP + EMA GL + eps)) delta
+      C3  unrealized_norm      (unrealized_pnl / initial_balance) * unrealized_weight
+      C4  inactivity_penalty   (-inactivity_weight * max(0, steps_since_last - grace))
+      C5  holding_penalty      (-holding_penalty_per_step * avg_excess_steps_open)
+      C6  overexposure_penalty (-overexposure_weight * max(0, exposure_R - budget_R))
+      C7  conflict_penalty     (-conflict_weight per symbol with both long & short open)
+      C8  churn_penalty        (-churn_weight if many tiny-R trades closed this step)
     """
 
     def __init__(
@@ -155,9 +154,12 @@ class RewardFunction(nn.Module):
         # ---------------- OPTIONAL COSTS (accepted for compatibility) ----------------
         # If your ENV already subtracts costs (your current setup), leave the defaults
         # and DO NOT enable integrate_costs_in_reward to avoid double-charging.
-        slippage_per_unit: float = 0.0,
-        commission_per_trade: float = 0.0,
+        slippage_per_unit: float = 0.0,   # in PRICE units per trade
+        commission_per_trade: float = 0.0,# in CURRENCY units per trade
         integrate_costs_in_reward: bool = False,
+
+        # Price→currency scale for 1 “volume” unit (e.g. 1 point * LOT_MULTIPLIER)
+        price_to_ccy_scale: Optional[float] = None,
 
         # absorb unknown future kwargs without crashing
         **extra_kwargs: Any,
@@ -209,10 +211,11 @@ class RewardFunction(nn.Module):
         self.device = device or torch.device("cpu")
         self.to(self.device)
 
-        # ---- NEW: store cost config (default keeps existing behavior) ----
+        # Costs & scale
         self.slippage_per_unit = float(slippage_per_unit)
         self.commission_per_trade = float(commission_per_trade)
         self.integrate_costs_in_reward = bool(integrate_costs_in_reward)
+        self.price_to_ccy_scale = float(price_to_ccy_scale or LOT_MULTIPLIER)
 
     # --------------------------
     # Lifecycle
@@ -222,7 +225,8 @@ class RewardFunction(nn.Module):
         self.ema_gross_profit.zero_()
         self.ema_gross_loss.zero_()
         self.previous_reward.zero_()
-        # --------------------------
+
+    # --------------------------
     # Main
     # --------------------------
     def forward(
@@ -239,36 +243,51 @@ class RewardFunction(nn.Module):
         device = self.device
         eps = float(EPS) if "EPS" in globals() else 1e-8
 
-        # --- C1: realized R (sum of clipped R across trades closed this step) ---
+        # --- C1: realized R (mean of clipped R across trades closed this step) ---
         realized_r_list: List[float] = []
         gross_profit_step = 0.0
         gross_loss_step = 0.0
 
         if closed_trades:
             for t in closed_trades:
-                # Use net PnL for reward if enabled
-                pnl_raw = _safe_float(t.get("pnl", 0.0))
-                fees = _safe_float(t.get("slippage", 0.0)) + _safe_float(t.get("commission", 0.0))
-                pnl_eff = pnl_raw - fees if self.integrate_costs_in_reward else pnl_raw
+                # Units:
+                #  - trade["pnl"] and SL/entry distances are in PRICE units
+                #  - slippage is PRICE units per trade
+                #  - commission is CURRENCY units per trade
+                scale = self.price_to_ccy_scale
+                vol = abs(_safe_float(t.get("volume", 1.0)) or 1.0)
 
-                # Feed net PnL into the R-multiple computation
+                pnl_raw_price = _safe_float(t.get("pnl", 0.0))
+                slip_price    = _safe_float(t.get("slippage", 0.0))
+                comm_ccy      = _safe_float(t.get("commission", 0.0))
+
+                pnl_raw_ccy = pnl_raw_price * scale * vol
+                slip_ccy    = slip_price    * scale * vol
+                fees_ccy    = slip_ccy + comm_ccy
+
+                pnl_eff_ccy = pnl_raw_ccy - fees_ccy if self.integrate_costs_in_reward else pnl_raw_ccy
+
+                # Feed currency PnL into R; risk_at_open scaled to currency per 1 volume
                 t_for_r = dict(t)
-                t_for_r["pnl"] = pnl_eff
+                t_for_r["pnl"] = pnl_eff_ccy
+                r_open_price = _safe_float(t.get("risk_at_open", 0.0))
+                if r_open_price > 0.0:
+                    t_for_r["risk_at_open"] = r_open_price * scale  # per-1-vol; _r_multiple applies *abs(vol)
+
                 r = _r_multiple_from_trade(t_for_r, self.min_risk, self.r_clip)
                 realized_r_list.append(r)
 
-                # EMA quality also based on effective (net) PnL
-                if pnl_eff > 0:
-                    gross_profit_step += pnl_eff
-                elif pnl_eff < 0:
-                    gross_loss_step += -pnl_eff  # absolute
+                # EMA quality on currency PnL
+                if pnl_eff_ccy > 0:
+                    gross_profit_step += pnl_eff_ccy
+                elif pnl_eff_ccy < 0:
+                    gross_loss_step += -pnl_eff_ccy  # absolute
+
         closed_count = len(realized_r_list)
         realized_R_sum = float(sum(realized_r_list)) if closed_count else 0.0
         realized_R_mean = (realized_R_sum / closed_count) if closed_count else 0.0
 
-
-
-       # --- C2: EMA quality (bounded) — use DELTA so no per-step bleed when idle ---
+        # --- C2: EMA quality (bounded) — use DELTA so no per-step bleed when idle ---
         with torch.no_grad():
             gp_prev = float(self.ema_gross_profit.item())
             gl_prev = float(self.ema_gross_loss.item())
@@ -287,9 +306,9 @@ class RewardFunction(nn.Module):
         if not closed_trades:
             quality_delta = 0.0
 
-
         # --- C3: unrealized normalized by balance (optional, small weight) ---
-        unreal_norm = float(unrealized_pnl) / max(self.initial_balance, eps)
+        # unrealized_pnl is in PRICE units; scale to currency for consistency
+        unreal_norm = (float(unrealized_pnl) * self.price_to_ccy_scale) / max(self.initial_balance, eps)
 
         # --- C4: inactivity (steps-based) — apply only when FLAT (no open trades) ---
         inactivity_pen = 0.0
@@ -298,7 +317,7 @@ class RewardFunction(nn.Module):
             extra_steps = max(0.0, steps_since_last - float(self.inactivity_grace_steps))
             inactivity_pen = -self.inactivity_weight * extra_steps
 
-        # --- C5: holding penalty (average excess hold time; avoids per-step saturation) ---
+        # --- C5: holding penalty (average excess hold time) ---
         holding_pen_total = 0.0
         if open_trades:
             excesses = []
@@ -311,7 +330,6 @@ class RewardFunction(nn.Module):
                 holding_pen_total = -self.holding_penalty_per_step * avg_excess
 
         # --- C6: overexposure penalty (risk budget in R units) ---
-        # Approximate each open trade as 1R of risk unless missing SL; if missing SL, treat as >1R to force discipline
         exposure_R = 0.0
         if open_trades:
             for t in open_trades:
@@ -319,7 +337,6 @@ class RewardFunction(nn.Module):
                 sl = _safe_float(t.get("stop_loss", 0.0))
                 vol = _safe_float(t.get("volume", 1.0)) or 1.0
                 side = _trade_side(t)
-                # if no SL, count as 2R risk; else ≈1R
                 if sl <= 0.0 or entry <= 0.0 or side == 0:
                     exposure_R += 2.0 * abs(vol)
                 else:
@@ -339,7 +356,7 @@ class RewardFunction(nn.Module):
                     continue
                 sym2dirs.setdefault(sym, set()).add(d)
             for sym, dirs in sym2dirs.items():
-                if 1 in dirs and -1 in dirs:  # both directions open on same symbol
+                if 1 in dirs and -1 in dirs:
                     conflict_pen -= self.conflict_weight
 
         # --- C8: churn penalty (many tiny-R closes) ---
@@ -354,7 +371,6 @@ class RewardFunction(nn.Module):
         if self.require_sl_tp and open_trades:
             for t in open_trades:
                 if _safe_float(t.get("stop_loss", 0.0)) <= 0.0 or _safe_float(t.get("take_profit", 0.0)) <= 0.0:
-                    # small shaping push to attach SL/TP
                     sltp_pen -= 0.05
 
         # --------------------------
@@ -379,19 +395,19 @@ class RewardFunction(nn.Module):
         total = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8
         # Expose component breakdown (pre-final-clip) for logging/debug
         self.last_components = {
-        "C1_realizedR": float(C1),
-        "C2_quality": float(C2),
-        "C3_unreal": float(C3),
-        "C4_inactivity": float(C4),
-        "C5_holding": float(C5),
-        "C6_overexp": float(C6),
-        "C7_conflict": float(C7),
-        "C8_churnSLTP": float(C8),
-        "realized_R_mean": float(realized_R_mean),  # NEW
-        "closed_count": float(closed_count),        # (optional—already have n_closed in env)
-        "total_before_clip": float(total),
-         }
-        # Optional final clamp (wider than ±1 to keep gradients alive)
+            "C1_realizedR": float(C1),
+            "C2_quality": float(C2),
+            "C3_unreal": float(C3),
+            "C4_inactivity": float(C4),
+            "C5_holding": float(C5),
+            "C6_overexp": float(C6),
+            "C7_conflict": float(C7),
+            "C8_churnSLTP": float(C8),
+            "realized_R_mean": float(realized_R_mean),
+            "closed_count": float(closed_count),
+            "total_before_clip": float(total),
+        }
+        # Optional final clamp
         if self.final_clip is not None and self.final_clip > 0:
             total = max(-self.final_clip, min(self.final_clip, total))
 
@@ -406,8 +422,7 @@ class RewardFunction(nn.Module):
 
 
 # ---------------------------------------------------------------------
-# Convenience wrappers (kept, but default to NO global reuse to avoid
-# cross-env leakage; use RewardFunction per-env in training code).
+# Convenience wrappers
 # ---------------------------------------------------------------------
 
 _default_rf_instance: Optional[RewardFunction] = None
@@ -418,7 +433,7 @@ def compute_event_reward(
     account_balance: float,
     unrealized_pnl: float,
     time_since_last_trade: float,
-    reuse: bool = False,  # default changed to False to avoid global shared state (fixes #7)
+    reuse: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     """
