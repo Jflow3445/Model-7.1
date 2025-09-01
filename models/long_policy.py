@@ -161,7 +161,7 @@ class CrossAssetAttention(nn.Module):
         max_rows = int(os.environ.get("LONG_XATTN_MAX_ROWS", "4096"))
         outs = []
         for xi in x.split(max_rows, dim=0):
-            with torch.cuda.amp.autocast(enabled=False):  # fp32 numerics
+            with torch.amp.autocast("cuda", enabled=False):  # fp32 numerics
                 y, _ = self.attn(xi.float(), xi.float(), xi.float(), need_weights=False)
                 o = self.ln((xi.float() + y))
             outs.append(o.to(dtype_in))
@@ -265,7 +265,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         bars = obs[:, :, : 4 * self.window].reshape(B, self.n_assets, self.window, 4)
 
         use_amp = torch.cuda.is_available()
-        with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             # Token path
             tok = self.token(self.in_ln(bars))  # [B,N,W,E]
 
@@ -322,7 +322,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
 
 
         dtype_in = seq.dtype
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             seq = self.final_ln(seq.float()).to(dtype_in)
 
         y = seq.reshape(B, self.n_assets, self.window, self.embed_dim)
@@ -463,6 +463,9 @@ class HybridActionDistribution(Distribution):
         self._disc_logits: Optional[torch.Tensor] = None
 
     def proba_distribution(self, discrete_logits: torch.Tensor, cont_mean: torch.Tensor, cont_log_std: torch.Tensor):
+        # ── Clamp categorical logits first for numerical stability
+        discrete_logits = torch.clamp(discrete_logits, -60.0, 60.0)
+
         if discrete_logits.dim() == 2:
             B = discrete_logits.shape[0]
             self._disc_logits = discrete_logits.view(B, self.n_assets, self.n_discrete)
@@ -470,21 +473,12 @@ class HybridActionDistribution(Distribution):
             self._disc_logits = discrete_logits
         else:
             raise ValueError("discrete_logits must be [B, N*8] or [B, N, 8]")
-        # ── NEW: final safety before handing to SB3 Normal
+
+        # ── Final safety before handing to SB3 Normal
         cont_mean    = torch.nan_to_num(cont_mean, nan=0.0, posinf=1e6, neginf=-1e6)
         cont_log_std = torch.clamp(cont_log_std, min=-5.0, max=2.0)
         self.cont_dist = self.cont_dist.proba_distribution(cont_mean, cont_log_std)
-        disc_logits = torch.clamp(disc_logits, -60.0, 60.0)
         return self
-    def proba_distribution_net(self, *args, **kwargs):
-        """
-        SB3 API compatibility stub:
-        ActorCriticPolicy expects distributions to expose `proba_distribution_net`
-        when the framework builds default action heads. We build the heads inside
-        the policy itself, so this net is unused. Returning (Identity, None)
-        satisfies the abstract interface without side-effects.
-        """
-        return nn.Identity(), None
 
     def actions_from_params(self, discrete_logits: torch.Tensor, cont_mean: torch.Tensor, cont_log_std: torch.Tensor, deterministic: bool = False):
         self.proba_distribution(discrete_logits, cont_mean, cont_log_std)
@@ -649,6 +643,9 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
             disc_logits = disc_logits / (self.base_disc_temperature * temps.clamp(min=0.2))
         else:
             disc_logits = disc_logits / self.base_disc_temperature
+
+        # ── NEW: keep categorical logits numerically safe
+        disc_logits = torch.clamp(disc_logits, -60.0, 60.0)
 
         # ── NEW: sanitize continuous head before creating the distribution
         cont_mean    = torch.nan_to_num(cont_mean, nan=0.0, posinf=1e6, neginf=-1e6)
