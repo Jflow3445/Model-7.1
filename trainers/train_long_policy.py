@@ -306,6 +306,17 @@ class EarlyStoppingCallback(EventCallback):
                 return False
         return True
 
+class LogStdCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        try:
+            log_std = getattr(self.model.policy, "log_std", None)
+            if log_std is not None:
+                self.model.logger.record("policy/std", float(log_std.exp().mean().item()))
+        except Exception:
+            pass
+        return True
+
+
 class LogRewardComponentsCallback(BaseCallback):
     """
     Aggregate env.info[] keys across the last rollout and push them into the SB3 logger
@@ -445,14 +456,14 @@ class LongBacktestEnv(gym.Env):
 
         # time pressure ↓ and only when flat
         inactivity_weight=0.00005,
-        inactivity_grace_steps=60,
+        inactivity_grace_steps=2,
 
         # holding penalty gentler
-        holding_threshold_steps=80,
-        holding_penalty_per_step=0.0002,
+        holding_threshold_steps=30,
+        holding_penalty_per_step=0.0006,
 
         # slightly lower so C1 less likely to clip after switching to mean
-        realized_R_weight=1.0,
+        realized_R_weight=10.0,
 
         risk_budget_R=risk_budget,
         overexposure_weight=0.015,
@@ -1036,17 +1047,23 @@ def train_long_policy(
     except Exception as e:
         print(f"[Monitor] Cleanup skipped: {e}")
     # VecEnv
+    # VecEnv (+ VecNormalize load/resume)
     env_fns = [make_long_env(i, SEED, window) for i in range(n_envs)]
     base_env = SubprocVecEnv(env_fns) if n_envs > 1 else DummyVecEnv([env_fns[0]])
 
-    # Reward normalization stabilizes the critic and advantage scale
-    vec_env = VecNormalize(
-        base_env,
-        norm_obs=False,          # leave obs as-is (you already layernorm inside the net)
-        norm_reward=True,        # <-- key
-        gamma=0.995,
-        clip_reward=float("inf"),
-    )
+    pkl_path = os.path.join(MODELS_DIR, "checkpoints_long", "vecnormalize.pkl")
+    if os.path.exists(pkl_path):
+        vec_env = VecNormalize.load(pkl_path, base_env)
+        vec_env.training = True
+    else:
+        vec_env = VecNormalize(
+            base_env,
+            norm_obs=True,             # ← enable obs normalization
+            norm_reward=True,
+            gamma=0.995,
+            clip_reward=float("inf"),
+        )
+
     n_steps = 1024
     rollout = n_steps * n_envs
     for cand in (1024, 512, 256, 128, 64):
@@ -1054,6 +1071,7 @@ def train_long_policy(
             batch_size = cand
             break
     print(f"[train_long] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
+    check_every = rollout
     
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
 
@@ -1114,17 +1132,20 @@ def train_long_policy(
 
     best_model_callback = SaveBestModelCallback(
         save_path=os.path.join(ckpt_dir, "long_policy_best.zip"),
-        check_freq=n_steps * n_envs,
-        rclone_dest=rclone_dest, 
+        check_freq=check_every,           # align with rollout
+        rclone_dest=rclone_dest,
         verbose=1,
     )
     early_stopping_callback = EarlyStoppingCallback(
-        check_freq=early_stopping_check_freq,
+        check_freq=check_every,           # align with rollout
         patience=patience,
         verbose=1,
     )
+
     comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)
-    callbacks = [comp_logger_callback, best_model_callback, early_stopping_callback]
+    log_std_callback = LogStdCallback()
+    callbacks = [comp_logger_callback, log_std_callback, best_model_callback, early_stopping_callback]
+
     if rclone_dest:
         checkpoint_callback = CheckpointAndRcloneCallback(
             checkpoint_freq=checkpoint_freq,
@@ -1145,6 +1166,13 @@ def train_long_policy(
             )
             model.save(last_ckpt_path)
             model.save(main_save_path)
+            # persist VecNormalize running stats for clean resumes
+            try:
+                vec_env.save(os.path.join(ckpt_dir, "vecnormalize.pkl"))
+                print(f"[VecNormalize] Saved running stats -> {os.path.join(ckpt_dir, 'vecnormalize.pkl')}")
+            except Exception as e:
+                print(f"[VecNormalize] Could not save stats: {e}")
+
             logger.info(f"Training complete. Model saved to {main_save_path} and {last_ckpt_path}")
         else:
             logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")
