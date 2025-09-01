@@ -479,6 +479,14 @@ class HybridActionDistribution(Distribution):
         cont_log_std = torch.clamp(cont_log_std, min=-5.0, max=2.0)
         self.cont_dist = self.cont_dist.proba_distribution(cont_mean, cont_log_std)
         return self
+    
+    def proba_distribution_net(self, *args, **kwargs):
+        """
+        SB3 requires distributions to expose this builder even if unused.
+        Our policy builds the heads itself, so return a no-op.
+        """
+        return nn.Identity(), None
+
 
     def actions_from_params(self, discrete_logits: torch.Tensor, cont_mean: torch.Tensor, cont_log_std: torch.Tensor, deterministic: bool = False):
         self.proba_distribution(discrete_logits, cont_mean, cont_log_std)
