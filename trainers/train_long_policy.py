@@ -393,6 +393,7 @@ class LongBacktestEnv(gym.Env):
         max_steps: Optional[int] = None,
         seed: int = SEED,
         initial_balance: float = INITIAL_BALANCE,
+        
     ):
         super().__init__()
         self.window = int(window)
@@ -402,6 +403,8 @@ class LongBacktestEnv(gym.Env):
         self.initial_balance = float(initial_balance)
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
+        self.arr: Dict[str, Dict[str, np.ndarray]] = {}  # per-symbol NumPy views
+
 
         # Broker meta (min_stop_price per symbol)
         self.broker_meta = load_broker_meta(BROKER_STOPS_JSON)
@@ -506,6 +509,7 @@ class LongBacktestEnv(gym.Env):
 
         # RAM-efficient load of only the needed rows
         self.dfs.clear()
+        self.arr.clear()
         min_len_after_atr = float("inf")
 
         for sym in self.symbols:
@@ -533,6 +537,16 @@ class LongBacktestEnv(gym.Env):
             self.dfs[sym] = df
             min_len_after_atr = min(min_len_after_atr, len(df))
 
+            # NumPy caches for fast access in _get_observation/step
+            self.arr[sym] = {
+                "open":  df["open"].to_numpy(np.float32),
+                "high":  df["high"].to_numpy(np.float32),
+                "low":   df["low"].to_numpy(np.float32),
+                "close": df["close"].to_numpy(np.float32),
+                "atr":   df["atr"].to_numpy(np.float32),
+            }
+
+
         # We loaded from (start_idx - window), so "start" within local slices == window
         self.cursor = self.window
 
@@ -558,27 +572,36 @@ class LongBacktestEnv(gym.Env):
         return obs.astype(np.float32), {}
     def _get_observation(self, idx: int) -> np.ndarray:
         obs_parts = []
+        ws = self.window
+        s = idx - ws
+        e = idx
+
         for i, sym in enumerate(self.symbols):
-            df = self.dfs[sym]
-            window_start = idx - self.window
-            slice_df = df.iloc[window_start:idx]
-            opens = slice_df["open"].to_numpy(dtype=np.float32)
-            highs = slice_df["high"].to_numpy(dtype=np.float32)
-            lows = slice_df["low"].to_numpy(dtype=np.float32)
-            closes = slice_df["close"].to_numpy(dtype=np.float32)
-            if any(len(arr) != self.window for arr in (opens, highs, lows, closes)):
+            arr = self.arr[sym]
+            opens  = arr["open"][s:e]
+            highs  = arr["high"][s:e]
+            lows   = arr["low"][s:e]
+            closes = arr["close"][s:e]
+
+            if any(len(a) != ws for a in (opens, highs, lows, closes)):
                 raise RuntimeError(
-                    f"[{sym}] expected window={self.window} but got "
+                    f"[{sym}] expected window={ws} but got "
                     f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} (idx={idx})"
                 )
+
             ot = self._get_open_trade(sym)
             if ot is None:
                 extra = np.array([0.0], dtype=np.float32)
             else:
                 held = float(self.current_step - ot.get("open_step", self.current_step))
                 extra = np.array([held if ot["trade_type"] == "long" else -held], dtype=np.float32)
-            obs_parts.append(np.concatenate([opens, highs, lows, closes, extra], axis=0))
+
+            obs_parts.append(
+                np.concatenate([opens, highs, lows, closes, extra], axis=0).astype(np.float32)
+            )
+
         return np.concatenate(obs_parts, axis=0)
+
 
     # Single open trade per symbol
     def _get_open_trade(self, sym: str) -> Optional[Dict[str, Any]]:
@@ -619,7 +642,8 @@ class LongBacktestEnv(gym.Env):
         any_illegal_attempt = False
         curr_close_by_sym: Dict[str, float] = {}
         for i, sym in enumerate(self.symbols):
-            df = self.dfs[sym]
+            arr = self.arr[sym]
+            o = arr["open"]; h = arr["high"]; l = arr["low"]; c = arr["close"]; a = arr["atr"]
             act = action[i * 10: (i + 1) * 10]
             # Safety net: never allow >1 open trade per symbol.
             open_for_sym = [t for t in self.open_trades if t["symbol"] == sym]
@@ -679,15 +703,13 @@ class LongBacktestEnv(gym.Env):
             curr_idx   = idx - 1  # last bar included in the observation slice
             if curr_idx < 0:
                 curr_idx = 0
-            curr_close = float(df.at[curr_idx, "close"])
-            atr_val    = float(df.at[curr_idx, "atr"])
+            curr_close = float(c[curr_idx])
+            atr_val    = float(a[curr_idx])
             curr_close_by_sym[sym] = curr_close
-
-            # Next bar (orders execute / SL/TP evaluated here)
-            next_open  = float(df.at[next_idx, "open"])
-            next_close = float(df.at[next_idx, "close"])
-            next_high  = float(df.at[next_idx, "high"])
-            next_low   = float(df.at[next_idx, "low"])
+            next_open  = float(o[next_idx])
+            next_close = float(c[next_idx])
+            next_high  = float(h[next_idx])
+            next_low   = float(l[next_idx])
 
             min_stop_price = float(self.broker_meta.get(sym, {}).get("min_stop_price", 0.0))
 
@@ -879,9 +901,8 @@ class LongBacktestEnv(gym.Env):
             sym = t["symbol"]
             cc = curr_close_by_sym.get(sym)
             if cc is None:
-                df_sym = self.dfs[sym]
                 ci = max(idx - 1, 0)
-                cc = float(df_sym.at[ci, "close"])
+                cc = float(self.arr[sym]["close"][ci])
             entry = float(t["entry_price"])
             if t["trade_type"] == "long":
                 unrealized_pnl += (cc - entry)
@@ -979,7 +1000,7 @@ class LongBacktestEnv(gym.Env):
 
     def render(self, mode="human"):
         idx = self.cursor
-        prices = {sym: float(self.dfs[sym].at[idx, "close"]) for sym in self.symbols}
+        prices = {sym: float(self.arr[sym]["close"][idx]) for sym in self.symbols}
         print(f"Step {self.current_step} | Prices={prices} | OpenTrades={len(self.open_trades)} | Balance={self.balance:.2f}")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1075,14 +1096,12 @@ def train_long_policy(
 
     vec_env = VecNormalize(
         base_env,
-        norm_obs=False,
+        norm_obs=True,
         norm_reward=True,
         gamma=0.995,
         clip_obs=10.0,               # ── NEW: clip obs to keep them sane
         clip_reward=float("inf"),
     )
-
-
     n_steps = 1024
     rollout = n_steps * n_envs
     for cand in (1024, 512, 256, 128, 64):

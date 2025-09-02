@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 from torch.utils.checkpoint import checkpoint
 from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -161,7 +161,7 @@ class CrossAssetAttention(nn.Module):
         max_rows = int(os.environ.get("LONG_XATTN_MAX_ROWS", "4096"))
         outs = []
         for xi in x.split(max_rows, dim=0):
-            with torch.amp.autocast("cuda", enabled=False):  # fp32 numerics
+            with torch.amp.autocast("cuda", enabled=True):  # fp32 numerics
                 y, _ = self.attn(xi.float(), xi.float(), xi.float(), need_weights=False)
                 o = self.ln((xi.float() + y))
             outs.append(o.to(dtype_in))
