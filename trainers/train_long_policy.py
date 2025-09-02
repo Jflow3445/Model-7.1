@@ -18,7 +18,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 import subprocess
 from stable_baselines3.common.vec_env import VecNormalize
-
+import queue, threading, shutil, atexit, sys
 # Policies / extractor (the recurrent policy may or may not exist in your repo)
 from models.long_policy import (
     LongTermOHLCPolicy,
@@ -52,6 +52,61 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ──────────────────────────────────────────────────────────────────────────────
+class AsyncUploader:
+    def __init__(self, dest: str, max_queue:int=4):
+        self.dest = dest
+        self.q = queue.Queue(max_queue)
+        self.t = threading.Thread(target=self._worker, daemon=True)
+        self.t.start()
+        atexit.register(self.wait)
+
+    def submit(self, file_path: str):
+        try:
+            self.q.put_nowait(file_path)
+            return True
+        except queue.Full:
+            print(f"[Checkpoint] upload queue full; skipping {os.path.basename(file_path)}")
+            return False
+
+    def _worker(self):
+        while True:
+            path = self.q.get()
+            if path is None:  # shutdown
+                self.q.task_done()
+                break
+            try:
+                if not os.path.exists(path):
+                    print(f"[Checkpoint] file vanished, skip: {path}")
+                elif not self.dest:
+                    # nothing to do if no remote set
+                    pass
+                else:
+                    # low-priority, non-blocking process; no stdout/stderr spam
+                    cmd = ["rclone", "copy", path, self.dest,
+                           "--drive-chunk-size", "64M", "--transfers", "1",
+                           "--checkers", "2", "-q"]
+                    # Optionally "nice" the process on Linux:
+                    if shutil.which("nice"):
+                        cmd = ["nice", "-n", "19"] + cmd
+                    # Start and do NOT wait:
+                    subprocess.Popen(cmd,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     start_new_session=True)
+                    print(f"[Checkpoint] enqueued → {os.path.basename(path)} -> {self.dest}")
+            except Exception as e:
+                print(f"[Checkpoint] async push error: {e}", file=sys.stderr)
+            finally:
+                self.q.task_done()
+
+    def wait(self):
+        """Drain outstanding uploads at process exit (non-blocking during training)."""
+        try:
+            self.q.put(None)
+            self.q.join()
+        except Exception:
+            pass
+
 def _to_float(x):
     try:
         return float(x.item())
@@ -130,6 +185,8 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
         tp = entry - tp_dist
     return sl, tp
 
+RCLONE_DEST = os.getenv("RCLONE_DEST", "")
+ASYNC_UPLOADER = AsyncUploader(RCLONE_DEST) if RCLONE_DEST else None
 # ──────────────────────────────────────────────────────────────────────────────
 # Callbacks (mirrors onemin style)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -166,20 +223,10 @@ class CheckpointAndRcloneCallback(BaseCallback):
             raise RuntimeError(f"Checkpoint file missing after save: {fzip}")
 
         # Only push if a remote is configured
-        if self.rclone_dest:
-            cmd = [
-                "rclone", "copy", fzip, self.rclone_dest,
-                "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
-            ]
-            try:
-                subprocess.run(cmd, check=True)
-                print(f"[Checkpoint] pushed {os.path.basename(fzip)} -> {self.rclone_dest}")
-            except subprocess.CalledProcessError as e:
-                # If you prefer to continue training on upload failures, change this to a print().
-                print("[Checkpoint] remote push failed.")
+        if self.rclone_dest and ASYNC_UPLOADER:
+            ASYNC_UPLOADER.submit(fzip)  # returns immediately
         else:
             print("[Checkpoint] No RCLONE_DEST set; skipped remote upload.")
-
         return True
 
 class SaveBestModelCallback(BaseCallback):
@@ -240,18 +287,10 @@ class SaveBestModelCallback(BaseCallback):
             if self.verbose:
                 print(f"[SaveBestModel] New best → saved to {best_zip}")
 
-            # Optionally push to remote
-            if self.rclone_dest:
-                cmd = [
-                    "rclone", "copy", best_zip, self.rclone_dest,
-                    "--drive-chunk-size", "64M", "--transfers", "2", "--checkers", "4", "-q"
-                ]
-                try:
-                    subprocess.run(cmd, check=True)
-                    if self.verbose:
-                        print(f"[SaveBestModel] pushed {os.path.basename(best_zip)} -> {self.rclone_dest}")
-                except subprocess.CalledProcessError:
-                    print("[SaveBestModel] remote push failed.")
+            # Optionally push to remote (non-blocking)
+            if self.rclone_dest and ASYNC_UPLOADER:
+                ASYNC_UPLOADER.submit(best_zip)
+
         return True
     
 
@@ -1217,6 +1256,8 @@ def train_long_policy(
         else:
             logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")
     finally:
+        if ASYNC_UPLOADER:
+            ASYNC_UPLOADER.wait()  # drain queue at the very end only
         vec_env.close()
 if __name__ == "__main__":
     train_long_policy()
