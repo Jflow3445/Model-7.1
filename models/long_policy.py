@@ -589,6 +589,7 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         self.n_cont = 2
         self.base_disc_temperature = float(max(0.4, min(2.0, base_disc_temperature)))
         self.state_dependent_std = bool(state_dependent_std)
+        self._last_log_std: Optional[torch.Tensor] = None
 
         kwargs.pop("net_arch", None)
 
@@ -661,6 +662,7 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         # ── NEW: sanitize continuous head before creating the distribution
         cont_mean    = torch.nan_to_num(cont_mean, nan=0.0, posinf=1e6, neginf=-1e6)
         cont_log_std = torch.clamp(cont_log_std, min=-5.0, max=2.0)
+        self._last_log_std = cont_log_std.detach()
         return self._hybrid.proba_distribution(disc_logits, cont_mean, cont_log_std)
 
     def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -704,7 +706,19 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         cont = a[..., self.n_assets * self.n_disc :].clamp(-1.0, 1.0)
         out = torch.cat([disc, cont], dim=-1)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
+    
+    def get_log_std_for_logging(self) -> Optional[torch.Tensor]:
+        """
+        Prefer the last log_std we actually used to build the distribution.
+        Fallback to the underlying hybrid's continuous distribution if needed.
+        """
+        if isinstance(self._last_log_std, torch.Tensor):
+            return self._last_log_std
+        try:
+            cd = getattr(self._hybrid, "cont_dist", None)
+            return getattr(cd, "log_std", None)
+        except Exception:
+            return None
     def get_regime_logits(self) -> Optional[torch.Tensor]:
         return getattr(self, "_last_regime_logits", None)
 # Export list

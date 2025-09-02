@@ -47,6 +47,7 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.002
+MIN_MANUAL_HOLD_STEPS = 2
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -347,11 +348,26 @@ class EarlyStoppingCallback(EventCallback):
 class LogStdCallback(BaseCallback):
     def _on_step(self) -> bool:
         try:
-            log_std = getattr(self.model.policy, "log_std", None)
+            log_std = None
+
+            # 1) Preferred: what the policy actually used this rollout
+            if hasattr(self.model.policy, "get_log_std_for_logging"):
+                log_std = self.model.policy.get_log_std_for_logging()
+
+            # 2) Fallbacks for other policies / modes
             if log_std is None:
-                dist = getattr(self.model.policy, "action_dist", None)
-                log_std = getattr(dist, "log_std", None) if dist is not None else None
-            if log_std is not None:
+                log_std = getattr(self.model.policy, "log_std", None)           # global param path
+            if log_std is None:
+                # our hybrid distribution lives under _hybrid
+                hybrid = getattr(self.model.policy, "_hybrid", None)
+                if hybrid is not None:
+                    cont_dist = getattr(hybrid, "cont_dist", None)
+                    log_std = getattr(cont_dist, "log_std", None)
+
+            if isinstance(log_std, (np.ndarray, float)):
+                std_val = float(np.exp(log_std).mean())
+                self.model.logger.record("policy/std", std_val)
+            elif hasattr(log_std, "exp"):
                 self.model.logger.record("policy/std", float(log_std.exp().mean().item()))
         except Exception:
             pass
@@ -661,6 +677,13 @@ class LongBacktestEnv(gym.Env):
                 valid[4] = False  # can't close short
             elif ot["trade_type"] == "short":
                 valid[3] = False  # can't close long
+
+            # NEW: enforce a minimum hold before manual close is allowed
+            held = self.current_step - ot.get("open_step", self.current_step)
+            if held < MIN_MANUAL_HOLD_STEPS:
+                valid[3] = False  # close long
+                valid[4] = False  # close short
+                valid[7] = False  # close all
             # 5 (adjust SL) and 6 (adjust TP) remain valid while in a trade
         else:
             # Not in trade -> cannot close/adjust/close-all
@@ -715,9 +738,6 @@ class LongBacktestEnv(gym.Env):
             masked = self._mask_illegal_actions(i, act)         # sets invalid heads to -inf
             masked_head = masked[:8]
             act_id = int(np.argmax(masked_head))
-
-            # (C) Optional: small penalty if the policy's original choice was illegal
-            #      (define the valid mask the same way as the masker does)
             valid = np.ones(8, dtype=bool)
             ot = self._get_open_trade(sym)
             if ot is not None:
@@ -727,11 +747,15 @@ class LongBacktestEnv(gym.Env):
                     valid[4] = False  # can't close short
                 elif ot["trade_type"] == "short":
                     valid[3] = False  # can't close long
-                # 5 (adjust SL) and 6 (adjust TP) are valid while in a trade
+
+                # Enforce minimum hold before manual close (mirror _mask_illegal_actions)
+                held = self.current_step - ot.get("open_step", self.current_step)
+                if held < MIN_MANUAL_HOLD_STEPS:
+                    valid[3] = False  # close long
+                    valid[4] = False  # close short
+                    valid[7] = False  # close all
             else:
                 valid[3:8] = False  # cannot close/adjust when flat
-
-
             attempted_illegal = not valid[orig_action]
             if attempted_illegal:
                 any_illegal_attempt = True
@@ -793,6 +817,8 @@ class LongBacktestEnv(gym.Env):
                     trade_executed = True
 
             # --- Action: only if nothing executed yet ---
+            # --- Post-check: if still open now, allow SL/TP hits — but NOT for trades opened this step ---
+            # --- Action: only if nothing executed yet ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)  # refresh
 
@@ -844,23 +870,17 @@ class LongBacktestEnv(gym.Env):
                         entry=ref_price, sl_norm=sl_norm, tp_norm=0.0,
                         is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
-                    # --- Adjust Stop-Loss (tighten-only) ---
                     floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
                     old_sl = float(ot["stop_loss"])
-
                     if is_long:
-                        # stop must stay below price but can only move UP (toward price)
                         upper_bound = min(ot["take_profit"] - floor_price, ref_price - floor_price)
-                        candidate   = min(new_sl, upper_bound)   # respect floors/TP spacing
-                        new_sl      = max(old_sl, candidate)     # tighten-only: never below old_sl (no widening)
+                        candidate   = min(new_sl, upper_bound)
+                        new_sl      = max(old_sl, candidate)  # tighten-only
                     else:
-                        # stop must stay above price but can only move DOWN (toward price)
                         lower_bound = max(ot["take_profit"] + floor_price, ref_price + floor_price)
                         candidate   = max(new_sl, lower_bound)
-                        new_sl      = min(old_sl, candidate)     # tighten-only: never above old_sl (no widening)
-
+                        new_sl      = min(old_sl, candidate)  # tighten-only
                     ot["stop_loss"] = float(new_sl)
-
                     info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
 
                 elif act_id == 6 and ot is not None:
@@ -879,10 +899,10 @@ class LongBacktestEnv(gym.Env):
                     ot["take_profit"] = float(new_tp)
                     info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
 
-            # --- Post-check: if still open now (including newly opened), allow same-bar SL/TP hits ---
+            # --- Post-check: if still open now, allow SL/TP hits — but NOT for trades opened this step ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)
-                if ot is not None:
+                if ot is not None and ot.get("open_step", -1) != self.current_step:
                     long_side = (ot["trade_type"] == "long")
                     sl = float(ot["stop_loss"]); tp = float(ot["take_profit"]); entry = float(ot["entry_price"])
 
@@ -913,6 +933,7 @@ class LongBacktestEnv(gym.Env):
                         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                         info["closed_trades"].append(closed)
                         trade_executed = True
+
 
 
             self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
@@ -1216,11 +1237,10 @@ def train_long_policy(
         verbose=1,
     )
     early_stopping_callback = EarlyStoppingCallback(
-        check_freq=check_every,           # align with rollout
-        patience=patience,
-        verbose=1,
+    check_freq=early_stopping_check_freq or check_every,
+    patience=patience,
+    verbose=1,
     )
-
     comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)
     log_std_callback = LogStdCallback()
     callbacks = [comp_logger_callback, log_std_callback, best_model_callback, early_stopping_callback]
