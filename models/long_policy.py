@@ -723,5 +723,3 @@ class LongTermOHLCPolicy(ActorCriticPolicy):
         return getattr(self, "_last_regime_logits", None)
 # Export list
 __all__ = ["LongTermFeatureExtractor", "LongTermOHLCPolicy"]
-
-
