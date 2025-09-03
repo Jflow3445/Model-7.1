@@ -185,53 +185,52 @@ class LiveTradeEnv(gym.Env):
         self.medium_deques = {sym: deque(maxlen=self.medium_window) for sym in self.symbols}
         self.long_deques   = {sym: deque(maxlen=self.long_window)   for sym in self.symbols}
         self.onemin_deques = {sym: deque(maxlen=ONEMIN_OBS_WINDOW) for sym in self.symbols}
-        def _on_1min(sym: str, df: pd.DataFrame):
-            # Convert base symbol to actual environment symbol if needed (mirror hourly/daily logic)
+
+        def _on_1min(sym: str, when, bar):
+            # bar is a 4-tuple: (open, high, low, close)
             base = sym.split('.')[0].upper()
-            actual_sym = None
-            for env_sym in self.symbols:
-                if env_sym.split('.')[0].upper() == base:
-                    actual_sym = env_sym
-                    break
-            if actual_sym is None:
-                actual_sym = sym
-            for _, r in df.iterrows():
-                self.onemin_deques[actual_sym].append((r.open, r.high, r.low, r.close))
+            actual_sym = next((e for e in self.symbols if e.split('.')[0].upper() == base), sym)
+            self.onemin_deques[actual_sym].append(tuple(map(float, bar)))
+
         data_system.register_1min_handler(_on_1min)
 
-        def _on_hour(sym: str, df: pd.DataFrame):
-            # Convert base symbol to actual environment symbol (if needed)
+        def _on_hour(sym: str, when, bar):
             base = sym.split('.')[0].upper()
-            # If the environment’s symbol list contains a suffix version for this base, use it
-            actual_sym = None
-            for env_sym in self.symbols:
-                if env_sym.split('.')[0].upper() == base:
-                 actual_sym = env_sym
-                 break
-            if actual_sym is None:
-                actual_sym = sym  # default to given name if no special mapping
-            # Append bars to the correct deque
-            for _, r in df.iterrows():
-                self.medium_deques[actual_sym].append((r.open, r.high, r.low, r.close))
-
-        def _on_day(sym: str, df: pd.DataFrame):
-            # Convert base symbol to actual environment symbol (if needed)
-            base = sym.split('.')[0].upper()
-            # If the environment’s symbol list contains a suffix version for this base, use it
-            actual_sym = None
-            for env_sym in self.symbols:
-                if env_sym.split('.')[0].upper() == base:
-                 actual_sym = env_sym
-                 break
-            if actual_sym is None:
-                actual_sym = sym  # default to given name if no special mapping
-            # Append bars to the correct deque
-            for _, r in df.iterrows():
-                self.long_deques[actual_sym].append((r.open, r.high, r.low, r.close))
+            actual_sym = next((e for e in self.symbols if e.split('.')[0].upper() == base), sym)
+            self.medium_deques[actual_sym].append(tuple(map(float, bar)))
 
         data_system.register_hourly_handler(_on_hour)
+
+        def _on_day(sym: str, when, bar):
+            base = sym.split('.')[0].upper()
+            actual_sym = next((e for e in self.symbols if e.split('.')[0].upper() == base), sym)
+            self.long_deques[actual_sym].append(tuple(map(float, bar)))
+
         data_system.register_daily_handler(_on_day)
 
+                # --- Hydrate env OHLC deques from data_system history (immediate warm start) ---
+        try:
+            for env_sym in self.symbols:
+                # Use the env's actual symbol string; ForexDataSystem resolved to actual names too
+                m1_arr = self.data_system.get_minute_ohlc(env_sym, ONEMIN_OBS_WINDOW) or None
+                if m1_arr is not None:
+                    self.onemin_deques[env_sym].clear()
+                    for (o, h, l, c) in m1_arr[-ONEMIN_OBS_WINDOW:]:
+                        self.onemin_deques[env_sym].append((o, h, l, c))
+
+                h1_arr = self.data_system.get_hourly_ohlc(env_sym, self.medium_window) or None
+                if h1_arr is not None:
+                    self.medium_deques[env_sym].clear()
+                    for (o, h, l, c) in h1_arr[-self.medium_window:]:
+                        self.medium_deques[env_sym].append((o, h, l, c))
+
+                d1_arr = self.data_system.get_daily_ohlc(env_sym, self.long_window) or None
+                if d1_arr is not None:
+                    self.long_deques[env_sym].clear()
+                    for (o, h, l, c) in d1_arr[-self.long_window:]:
+                        self.long_deques[env_sym].append((o, h, l, c))
+        except Exception as _e:
+            logger.warning(f"Initial OHLC hydration from data_system failed: {_e}")
         # Reward functions per symbol
         self.reward_step_seconds = 60.0  # 1 “step” = 60s for reward timing
         self.reward_fns: Dict[str, RewardFunction] = {

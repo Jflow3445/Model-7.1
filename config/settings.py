@@ -44,7 +44,7 @@ TRAIN_MODE:   Final[bool]     = RUN_MODE == RunMode.TRAINING
 # --- Policy toggles (1 = enabled, 0 = disabled) ---
 ENABLE_ONEMIN: bool = bool(int(_env("ENABLE_ONEMIN", 0)))
 ENABLE_MEDIUM: bool = bool(int(_env("ENABLE_MEDIUM", 0)))
-ENABLE_LONG:   bool = bool(int(_env("ENABLE_LONG",   0)))
+ENABLE_LONG:   bool = bool(int(_env("ENABLE_LONG",   1)))
 
 
 # --------------------------------------------------------------------------- #
