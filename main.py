@@ -13,7 +13,6 @@ import sys as _sys
 _sys.modules.setdefault("gym", gym) 
 import torch
 from stable_baselines3 import PPO
-import requests
 from config.settings import (
     BASE_DIR,
     ONEMIN_OBS_WINDOW,
@@ -28,8 +27,6 @@ from config.settings import (
     ENABLE_MEDIUM, 
     ENABLE_LONG
 )
-from utils.logging_utils import log_event
-from utils.file_utils import log_transition
 from envs.live_env import LiveTradeEnv
 from models.onemin_policy import OneMinOHLCPolicy
 from models.medium_policy import MediumTermOHLCPolicy
@@ -112,12 +109,15 @@ def build_medium_obs(
             logging.warning(f"[build_medium_obs] Insufficient medium‐bars for {s}")
             return None
         # Fix: Use full OHLC per bar
-        arr = np.array([[o, h, l, c] for (o, h, l, c) in bars[-expected_bars:]], dtype=np.float32).flatten()
-        elapsed = np.array([time.time() - env.last_trade_time[s]], dtype=np.float32)
+                # Long policy expects 5 values/bar + 1 extra → pad a 5th channel if you only have OHLC
+        arr = np.array([[o, h, l, c, 0.0] for (o, h, l, c) in bars[-expected_bars:]], dtype=np.float32).flatten()
+        # elapsed is not used in long-term but keep for compatibility
+        elapsed = np.array([0.0], dtype=np.float32)
         o_full = np.concatenate([arr, elapsed], axis=0)
-        # Expect 4*window + 1 features per symbol
-        if o_full.shape[0] != 4 * expected_bars + 1:
-            raise ValueError(f"[build_medium_obs] Expected {4*expected_bars+1} elements for {s}, got {o_full.shape[0]}")
+        # Expect 5*window + 1 features per symbol
+        if o_full.shape[0] != 5 * expected_bars + 1:
+            raise ValueError(f"[build_long_obs] Expected {5*expected_bars+1} elements for {s}, got {o_full.shape[0]}")
+
         obs_list.append(o_full)
     return np.concatenate(obs_list, axis=0)
 
@@ -184,7 +184,7 @@ class DummyMediumEnv(gym.Env):
 class DummyLongEnv(gym.Env):
     def __init__(self, n_symbols: int, long_window: int):
         super().__init__()
-        obs_dim = n_symbols * (4 * long_window + 1)
+        obs_dim = n_symbols * (5 * long_window + 1)
         low = np.full((obs_dim,), -np.inf, dtype=np.float32)
         high = np.full((obs_dim,),  np.inf, dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
@@ -250,9 +250,8 @@ class ModelManager:
                 policy_network_kwargs[key] = self._all_kwargs.pop(key)
 
         # Mirror use_sde into the policy (do NOT pop; we want PPO to see it too)
-        if "use_sde" in self._all_kwargs:
-            policy_network_kwargs["use_sde"] = self._all_kwargs["use_sde"]
         ppo_kwargs = self._all_kwargs
+        policy_network_kwargs.pop("use_sde", None)  # defensive: ensure it's not present
         try:
             self.model = PPO(
                 self.policy_class,
@@ -623,13 +622,14 @@ def main():
         med_flat  = m_logits_t.view(batch_size, -1)
         long_flat = l_logits_t.view(batch_size, -1)
         with torch.no_grad():
-            fused_actions_t, _ = arbiter(
-                onemin_flat,
-                med_flat,
-                long_flat,
-                history_t,
-               # boot_time=boot_time_t,
+            fused_actions_t, *_ = arbiter(
+                onemin_action=onemin_flat,
+                medium_action=med_flat,
+                long_action=long_flat,
+                history=history_t,
+                # boot_time=boot_time_t,  # optional in your build; commented in your code
                 regime_context=regime_context_t,
+                deterministic=True,  # matches your usage pattern for live execution
             )
         if torch.isnan(fused_actions_t).any():
             logging.error("[main] NaN detected in arbiter fused actions! Skipping this trading step.")
