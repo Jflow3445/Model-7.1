@@ -6,6 +6,7 @@ import random
 import logging
 import re
 import json
+import torch
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import numpy as np
@@ -233,71 +234,64 @@ class CheckpointAndRcloneCallback(BaseCallback):
         else:
             print("[Checkpoint] No RCLONE_DEST set; skipped remote upload.")
         return True
-
-class SaveBestModelCallback(BaseCallback):
-    def __init__(self, save_path, check_freq, rclone_dest: str = "", verbose=1):
+# ── REPLACEMENT START (SaveTrainBestByEpBuffer + EarlyStopping) ───────────────
+class SaveTrainBestByEpBuffer(BaseCallback):
+    """
+    Save 'training best' exactly by SB3's ep_info_buffer (same as ep_rew_mean).
+    Falls back to monitor.csv only if the buffer is empty.
+    """
+    def __init__(self, save_path: str, check_freq: int, rclone_dest: str = "", verbose: int = 1):
         super().__init__(verbose)
         self.save_path = save_path
         self.check_freq = int(check_freq)
-        self.best_mean_reward = -np.inf
-        # Allow either explicit arg or env var
+        self.best_mean = -np.inf
         self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
 
-    def _on_step(self) -> bool:
-        if int(self.model.num_timesteps) % int(self.check_freq) != 0:
-            return True
-        # Gather recent episodic returns
+    def _mean_from_ep_buffer(self) -> Optional[float]:
+        buf = getattr(self.model, "ep_info_buffer", None)
+        if buf and len(buf) > 0:
+            try:
+                return float(np.mean([e["r"] for e in buf]))
+            except Exception:
+                return None
+        return None
+
+    def _mean_from_monitor_csv(self) -> Optional[float]:
         results = []
         for i in range(self.training_env.num_envs):
             monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
             if os.path.exists(monitor_file):
-                df = pd.read_csv(monitor_file, skiprows=1)
-                if "r" in df.columns:
-                    results.extend(df["r"].values[-200:])  # last 200 episodic returns
+                try:
+                    df = pd.read_csv(monitor_file, skiprows=1)
+                    if "r" in df.columns:
+                        results.extend(df["r"].values[-200:])  # last 200 episodic returns
+                except Exception:
+                    pass
+        if results:
+            return float(np.mean(results))
+        return None
 
-        if not results:
+    def _on_step(self) -> bool:
+        if (int(self.model.num_timesteps) % self.check_freq) != 0:
             return True
 
-        mean_reward = float(np.mean(results))
-        # Print last-200 episode means for any rw_* columns if present
-        try:
-            comp_means = {}
-            for i in range(self.training_env.num_envs):
-                monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
-                if os.path.exists(monitor_file):
-                    df = pd.read_csv(monitor_file, skiprows=1)
-                    cols = [c for c in df.columns if c.startswith("rw_")]
-                    if cols:
-                        tail = df[cols].tail(200)
-                        # merge (mean across envs)
-                        for c in cols:
-                            comp_means[c] = comp_means.get(c, []) + [tail[c].mean()]
-            if comp_means and self.verbose:
-                msg = " | ".join(
-                    f"{k}={np.nanmean(v):.3f}" for k, v in sorted(comp_means.items())
-                )
-                print(f"[Diagnostics] {msg}")
-        except Exception:
-            pass
+        mean_r = self._mean_from_ep_buffer()
+        if mean_r is None:
+            mean_r = self._mean_from_monitor_csv()
+        if mean_r is None:
+            return True
 
         if self.verbose:
-            print(f"[SaveBestModel] mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f}")
+            print(f"[TrainBest] mean={mean_r:.3f} best={self.best_mean:.3f}")
 
-        if mean_reward > self.best_mean_reward + 1e-4:
-            self.best_mean_reward = mean_reward
-            # Save best model
+        if mean_r > self.best_mean + 1e-4:
+            self.best_mean = mean_r
             self.model.save(self.save_path)
-            # Ensure path points to the .zip file SB3 writes
             best_zip = self.save_path if self.save_path.endswith(".zip") else self.save_path + ".zip"
-            if self.verbose:
-                print(f"[SaveBestModel] New best → saved to {best_zip}")
-
-            # Optionally push to remote (non-blocking)
+            print(f"[TrainBest] New best → {best_zip}")
             if self.rclone_dest and ASYNC_UPLOADER:
                 ASYNC_UPLOADER.submit(best_zip)
-
         return True
-    
 
 class _NoOpCallback(BaseCallback):
     def _on_step(self) -> bool:
@@ -305,32 +299,51 @@ class _NoOpCallback(BaseCallback):
 
 class EarlyStoppingCallback(EventCallback):
     """
-    Patience-based early stopping using mean monitor reward (mirrors onemin).
+    Patience-based early stopping using the SAME metric as SB3 ep_rew_mean,
+    with fallback to monitor.csv when the buffer is empty.
     """
     def __init__(self, check_freq: int, patience: int, verbose=1):
         super().__init__(callback=_NoOpCallback(), verbose=verbose)
-        self.check_freq = check_freq
-        self.patience = patience
+        self.check_freq = int(check_freq)
+        self.patience = int(patience)
         self.best_mean_reward = -np.inf
         self.counter = 0
         self.verbose = verbose
 
-    def _on_step(self) -> bool:
-        # Trigger on exact timesteps so it lines up with checkpoint_freq etc.
-        if int(self.model.num_timesteps) % self.check_freq != 0:
-            return True
+    def _mean_from_ep_buffer(self) -> Optional[float]:
+        buf = getattr(self.model, "ep_info_buffer", None)
+        if buf and len(buf) > 0:
+            try:
+                return float(np.mean([e["r"] for e in buf]))
+            except Exception:
+                return None
+        return None
+
+    def _mean_from_monitor_csv(self) -> Optional[float]:
         results = []
         for i in range(self.training_env.num_envs):
             monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
             if os.path.exists(monitor_file):
-                df = pd.read_csv(monitor_file, skiprows=1)
-                if "r" in df.columns:
-                    results.extend(df["r"].values[-200:])
+                try:
+                    df = pd.read_csv(monitor_file, skiprows=1)
+                    if "r" in df.columns:
+                        results.extend(df["r"].values[-200:])
+                except Exception:
+                    pass
+        if results:
+            return float(np.mean(results))
+        return None
 
-        if not results:
+    def _on_step(self) -> bool:
+        if int(self.model.num_timesteps) % self.check_freq != 0:
             return True
 
-        mean_reward = float(np.mean(results))
+        mean_reward = self._mean_from_ep_buffer()
+        if mean_reward is None:
+            mean_reward = self._mean_from_monitor_csv()
+        if mean_reward is None:
+            return True
+
         if self.verbose:
             print(
                 f"[EarlyStopping] step={self.num_timesteps} "
@@ -347,6 +360,136 @@ class EarlyStoppingCallback(EventCallback):
                 if self.verbose:
                     print("[EarlyStopping] Patience exceeded → stopping training.")
                 return False
+        return True
+
+def build_eval_env(make_env_fn, n_envs: int, vecnorm_stats_path: str) -> VecNormalize:
+    """
+    Build a frozen-eval VecNormalize env that shares preprocessing
+    but does NOT update running stats.
+    """
+    envs = [make_env_fn(i, SEED + 10_000 + i, window=LONG_OBS_WINDOW) for i in range(n_envs)]
+    base = DummyVecEnv(envs)
+    if os.path.exists(vecnorm_stats_path):
+        eval_vec = VecNormalize.load(vecnorm_stats_path, base_env=base)
+    else:
+        eval_vec = VecNormalize(base, norm_obs=True, norm_reward=True, gamma=0.995, clip_obs=10.0, clip_reward=float("inf"))
+    eval_vec.training = False
+    eval_vec.norm_reward = False  # report raw env reward
+    return eval_vec
+
+@torch.no_grad()
+def evaluate_model(model, eval_env: VecNormalize, episodes: int = 20, deterministic: bool = True):
+    """
+    Vectorized, deterministic evaluation:
+      - Accumulates per-env episodic returns/lengths
+      - Stops when total completed episodes >= `episodes`
+      - Tracks illegal attempts across infos
+    """
+    n = getattr(eval_env, "num_envs", 1)
+    obs = eval_env.reset()
+    ep_ret = np.zeros(n, dtype=np.float64)
+    ep_len = np.zeros(n, dtype=np.int32)
+    ep_returns: List[float] = []
+    ep_lens: List[int] = []
+    illegal = 0
+    steps = 0
+    done_count = 0
+
+    while done_count < episodes:
+        actions, _ = model.predict(obs, deterministic=deterministic)
+        obs, rewards, dones, infos = eval_env.step(actions)
+        r = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        ep_ret += r
+        ep_len += 1
+        steps += n
+
+        # count illegal attempts from info dicts
+        if isinstance(infos, (list, tuple)):
+            for info in infos:
+                if isinstance(info, dict):
+                    illegal += int(info.get("illegal_attempts", 0))
+
+        # handle per-env episode completion
+        dones = np.asarray(dones).reshape(-1)
+        for i in range(n):
+            if dones[i]:
+                ep_returns.append(float(ep_ret[i]))
+                ep_lens.append(int(ep_len[i]))
+                done_count += 1
+                # auto-reset occurs inside Dummy/SubprocVecEnv; counters must reset too
+                ep_ret[i] = 0.0
+                ep_len[i] = 0
+                if done_count >= episodes:
+                    break
+
+    mean_ret = float(np.mean(ep_returns))
+    std_ret = float(np.std(ep_returns) + 1e-8)
+    # downside deviation proxy
+    downside = np.std([min(0.0, r - mean_ret) for r in ep_returns]) + 1e-8
+    sortino = mean_ret / downside
+
+    # crude max drawdown proxy from episodic return set (replace with equity MDD if available)
+    max_dd = float(max(0.0, -min(ep_returns))) if ep_returns else 0.0
+    illegal_rate = float(illegal) / max(1, steps)
+
+    return {
+        "mean_reward": mean_ret,
+        "std_reward": std_ret,
+        "sortino": float(sortino),
+        "max_drawdown": float(max_dd),
+        "illegal_rate": float(illegal_rate),
+        "episodes": int(episodes),
+    }
+
+def eval_score(metrics: dict) -> float:
+    # Tune to taste.
+    return (metrics["mean_reward"]
+            - 5.0 * metrics["max_drawdown"]
+            - 0.5 * metrics["illegal_rate"]
+            + 0.2 * metrics["sortino"])
+
+class EvalAndSaveDeployBestCallback(BaseCallback):
+    """
+    Periodically run a frozen eval on held-out seeds/time and save deploy best by composite score.
+    """
+    def __init__(self, vecnorm_stats_path: str, make_env_fn, n_eval_envs: int,
+                 episodes: int, check_freq: int, save_path: str, rclone_dest: str = "", verbose: int = 1):
+        super().__init__(verbose)
+        self.vecnorm_stats_path = vecnorm_stats_path
+        self.make_env_fn = make_env_fn
+        self.n_eval_envs = int(n_eval_envs)
+        self.episodes = int(episodes)
+        self.check_freq = int(check_freq)
+        self.save_path = save_path
+        self.best_score = -np.inf
+        self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
+
+    def _on_step(self) -> bool:
+        if (int(self.model.num_timesteps) % self.check_freq) != 0:
+            return True
+
+        eval_env = build_eval_env(self.make_env_fn, self.n_eval_envs, self.vecnorm_stats_path)
+        try:
+            metrics = evaluate_model(self.model, eval_env, episodes=self.episodes, deterministic=True)
+        finally:
+            eval_env.close()
+
+        score = eval_score(metrics)
+        if self.verbose:
+            print(f"[DeployEval] score={score:.3f}  "
+                  f"mean={metrics['mean_reward']:.3f} sortino={metrics['sortino']:.3f} "
+                  f"mdd={metrics['max_drawdown']:.3f} ill={metrics['illegal_rate']:.4f}")
+        self.model.logger.record("eval/score", score)
+        for k, v in metrics.items():
+            self.model.logger.record(f"eval/{k}", v)
+
+        if score > self.best_score + 1e-4:
+            self.best_score = score
+            self.model.save(self.save_path)
+            best_zip = self.save_path if self.save_path.endswith(".zip") else self.save_path + ".zip"
+            print(f"[DeployEval] New deploy best → {best_zip}")
+            if self.rclone_dest and ASYNC_UPLOADER:
+                ASYNC_UPLOADER.submit(best_zip)
         return True
 
 class LogStdCallback(BaseCallback):
@@ -1271,25 +1414,54 @@ def train_long_policy(
         )
         timesteps_left = target_total_timesteps
 
-    # Callbacks (keep your existing classes)
-    # Build callback list (checkpoint only if RCLONE_DEST is set)
+        # ── REPLACEMENT START (callback wiring) ────────────────────────────────────
     rclone_dest = os.getenv("RCLONE_DEST")
+    vecnorm_stats_path = os.path.join(ckpt_dir, "vecnormalize.pkl")
+    try:
+        vec_env.save(vecnorm_stats_path)
+    except Exception as e:
+        print(f"[VecNormalize] Initial stats snapshot failed: {e}")
 
-    best_model_callback = SaveBestModelCallback(
-        save_path=os.path.join(ckpt_dir, "long_policy_best.zip"),
-        check_freq=check_every,           # align with rollout
-        rclone_dest=rclone_dest,
-        verbose=1,
-    )
-    early_stopping_callback = EarlyStoppingCallback(
-    check_freq=early_stopping_check_freq or check_every,
-    patience=patience,
-    verbose=1,
-    )
     comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)
     log_std_callback = LogStdCallback()
     feature_usage_callback = FeatureUsageCallback()
-    callbacks = [comp_logger_callback, log_std_callback, feature_usage_callback, best_model_callback, early_stopping_callback]
+
+    # Save "training best" using the exact SB3 ep_rew_mean metric
+    train_best_cb = SaveTrainBestByEpBuffer(
+        save_path=os.path.join(ckpt_dir, "long_policy_trainbest.zip"),
+        check_freq=check_every,  # one full rollout
+        rclone_dest=rclone_dest,
+        verbose=1,
+    )
+
+    # Periodic frozen eval → deploy best
+    rollouts_per_eval = 5  # tune to taste (5–10 typical)
+    deploy_best_cb = EvalAndSaveDeployBestCallback(
+        vecnorm_stats_path=vecnorm_stats_path,
+        make_env_fn=lambda rank, seed, window: make_long_env(rank, seed + 12345, window, symbols=LIVE_FOREX_PAIRS),
+        n_eval_envs=max(1, n_envs // 2),
+        episodes=max(10, n_envs),
+        check_freq=rollouts_per_eval * check_every,
+        save_path=os.path.join(ckpt_dir, "long_policy_deploybest.zip"),
+        rclone_dest=rclone_dest,
+        verbose=1,
+    )
+
+    early_stopping_callback = EarlyStoppingCallback(
+        check_freq=early_stopping_check_freq or check_every,
+        patience=patience,
+        verbose=1,
+    )
+
+    callbacks = [
+        comp_logger_callback,
+        log_std_callback,
+        feature_usage_callback,
+        train_best_cb,
+        deploy_best_cb,
+        early_stopping_callback,
+    ]
+
     if rclone_dest:
         checkpoint_callback = CheckpointAndRcloneCallback(
             checkpoint_freq=checkpoint_freq,
@@ -1300,6 +1472,7 @@ def train_long_policy(
         callbacks.insert(0, checkpoint_callback)
     else:
         print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
+    # ── REPLACEMENT END ────────────────────────────────────────────────────────
     # ── Train & save (same pattern as onemin) ────────────────────────────────
     try:
         if timesteps_left > 0:
