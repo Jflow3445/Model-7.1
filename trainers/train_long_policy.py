@@ -48,6 +48,10 @@ LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.002
 MIN_MANUAL_HOLD_STEPS = 2
+SL_ILLEGAL_PENALTY   = -0.02
+SL_COOLDOWN_STEPS    = 8
+SL_EARLY_STEPS       = 5
+
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -160,12 +164,12 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     Map normalized [-1,1] to price distances using ATR + broker + price floors.
     Prevents microscopic stops when ATR is tiny.
     """
-    FLOOR_FRAC_ATR = 0.40
-    K_SL_ATR = 0.80
-    K_TP_ATR = 1.60
+    FLOOR_FRAC_ATR = 0.60
+    K_SL_ATR = 1.20
+    K_TP_ATR = 2.80
 
     # NEW: price-based floor (e.g., 5 bps of price)
-    PRICE_FRAC_FLOOR = 5e-4  # 0.05% of price
+    PRICE_FRAC_FLOOR = 1e-3  # 0.10% of price
 
     entry = float(entry)
     atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
@@ -456,6 +460,7 @@ class LongBacktestEnv(gym.Env):
         self.n_assets = len(self.symbols)
         self.seed_val = int(seed)
         self.initial_balance = float(initial_balance)
+        self.sl_cooldown = np.zeros(self.n_assets, dtype=np.int32)
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
         self.arr: Dict[str, Dict[str, np.ndarray]] = {}  # per-symbol NumPy views
@@ -485,7 +490,7 @@ class LongBacktestEnv(gym.Env):
             raise ValueError("max_steps ≤ 0 after clamping")
 
         # Spaces
-        obs_dim = self.n_assets * (4 * self.window + 1)
+        obs_dim = self.n_assets * (5 * self.window + 1)
         self.observation_space = spaces.Box(-np.inf, np.inf, (obs_dim,), np.float32)
         act_dim = self.n_assets * 10  # [one_hot(8), sl_norm, tp_norm] per asset
         self.action_space = spaces.Box(-1.0, 1.0, (act_dim,), np.float32)
@@ -501,7 +506,7 @@ class LongBacktestEnv(gym.Env):
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
-        risk_budget = max(6.0, 0.75 * self.n_assets)
+        risk_budget = max(4.0, 0.35 * self.n_assets)
 
         self.reward_fn = RewardFunction(
         initial_balance=self.initial_balance,
@@ -523,11 +528,11 @@ class LongBacktestEnv(gym.Env):
 
         # slightly lower so C1 less likely to clip after switching to mean
         realized_R_weight=10.0,
-
-        risk_budget_R=risk_budget,
-        overexposure_weight=0.015,
         unrealized_weight=0.03,
 
+        risk_budget_R=risk_budget,
+        overexposure_weight=0.03,
+        
         component_clip=3.0,
         final_clip=5.0,
          )
@@ -637,13 +642,13 @@ class LongBacktestEnv(gym.Env):
             highs  = arr["high"][s:e]
             lows   = arr["low"][s:e]
             closes = arr["close"][s:e]
+            atr    = arr["atr"][s:e]   
 
-            if any(len(a) != ws for a in (opens, highs, lows, closes)):
+            if any(len(a) != ws for a in (opens, highs, lows, closes, atr)):
                 raise RuntimeError(
                     f"[{sym}] expected window={ws} but got "
-                    f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} (idx={idx})"
+                    f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} atr={len(atr)} (idx={idx})"
                 )
-
             ot = self._get_open_trade(sym)
             if ot is None:
                 extra = np.array([0.0], dtype=np.float32)
@@ -652,7 +657,7 @@ class LongBacktestEnv(gym.Env):
                 extra = np.array([held if ot["trade_type"] == "long" else -held], dtype=np.float32)
 
             obs_parts.append(
-                np.concatenate([opens, highs, lows, closes, extra], axis=0).astype(np.float32)
+                np.concatenate([opens, highs, lows, closes, atr, extra], axis=0).astype(np.float32)
             )
 
         return np.concatenate(obs_parts, axis=0)
@@ -688,6 +693,9 @@ class LongBacktestEnv(gym.Env):
         else:
             # Not in trade -> cannot close/adjust/close-all
             valid[3:8] = False
+            if self.sl_cooldown[i] > 0:
+                valid[1] = False  # buy
+                valid[2] = False  # sell
 
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
@@ -695,6 +703,7 @@ class LongBacktestEnv(gym.Env):
 
 
     def step(self, action: np.ndarray):
+        sl_penalty_total = 0.0
         idx = self.cursor
         next_idx = idx + 1
 
@@ -801,6 +810,13 @@ class LongBacktestEnv(gym.Env):
                     exit_px = sl if hit_sl else tp
                     pnl = (exit_px - entry) if long_side else (entry - exit_px)
                     stop_type = "sl" if hit_sl else "tp"
+                    # NEW: cooldown + penalty on SL (extra if stopped very fast)
+                    if stop_type == "sl":
+                        self.sl_cooldown[i] = SL_COOLDOWN_STEPS
+                        sl_penalty_total += SL_ILLEGAL_PENALTY
+                        held_bars = self.current_step - ot.get("open_step", self.current_step)
+                        if held_bars <= SL_EARLY_STEPS:
+                            sl_penalty_total += SL_ILLEGAL_PENALTY
                     closed = dict(
                         **ot,
                         exit_price=exit_px,
@@ -919,6 +935,15 @@ class LongBacktestEnv(gym.Env):
                         exit_px = sl if hit_sl else tp
                         pnl = (exit_px - entry) if long_side else (entry - exit_px)
                         stop_type = "sl" if hit_sl else "tp"
+
+                        # NEW: cooldown + penalty on SL (extra if stopped very fast)
+                        if stop_type == "sl":
+                            self.sl_cooldown[i] = SL_COOLDOWN_STEPS
+                            sl_penalty_total += SL_ILLEGAL_PENALTY
+                            held_bars = self.current_step - ot.get("open_step", self.current_step)
+                            if held_bars <= SL_EARLY_STEPS:
+                                sl_penalty_total += SL_ILLEGAL_PENALTY
+
                         closed = dict(
                             **ot,
                             exit_price=exit_px,
@@ -1006,20 +1031,22 @@ class LongBacktestEnv(gym.Env):
         info["since_last_trade"] = float(global_since_last_trade)
         # ──────────────────────────────────────────────────────────────────────────────
         # keep your existing illegal-action penalties
+        # keep your existing illegal-action penalties
         if any_illegal_attempt:
             reward += ILLEGAL_ATTEMPT_PENALTY
 
-        # also add the severe penalty you accumulated
+        # add severe illegal penalty and SL shaping
         reward += float(illegal_penalty_total)
+        reward += float(sl_penalty_total)
 
-        # final clip AFTER penalties, same as 1-min
+        # final clip AFTER penalties
         final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
         reward = float(np.clip(reward, -final_cap, final_cap))
         # Keep only recent closed trades
         MAX_CLOSED_TRADES = 1000
         if len(self.closed_trades) > MAX_CLOSED_TRADES:
             self.closed_trades = self.closed_trades[-MAX_CLOSED_TRADES:]
-
+        self.sl_cooldown = np.maximum(self.sl_cooldown - 1, 0)
         self.current_step += 1
         terminated = self.current_step >= self.runtime_max_steps
         truncated = False
@@ -1114,6 +1141,24 @@ def get_latest_checkpoint(ckpt_dir: str, last_ckpt_path: str, main_save_path: st
 def steps_from_ckpt_name(path: str) -> int:
     m = re.search(r"ckpt_(\d+)_steps", os.path.basename(path))
     return int(m.group(1)) if m else 0
+
+class FeatureUsageCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        try:
+            fe = getattr(self.model.policy, "features_extractor", None)
+            if fe is not None:
+                gate = getattr(fe, "extras_gate", None)
+                extras_l1 = getattr(fe, "_extras_l1", None)
+                core_l1 = getattr(fe, "_core_l1", None)
+                if gate is not None:
+                    self.model.logger.record("features/extras_gate", float(gate.detach().cpu().item()))
+                if extras_l1 is not None:
+                    self.model.logger.record("features/extras_l1", float(extras_l1.cpu().item()))
+                if core_l1 is not None:
+                    self.model.logger.record("features/core_l1", float(core_l1.cpu().item()))
+        except Exception:
+            pass
+        return True
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Training (mirrors onemin structure, prefers recurrent)
@@ -1243,8 +1288,8 @@ def train_long_policy(
     )
     comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)
     log_std_callback = LogStdCallback()
-    callbacks = [comp_logger_callback, log_std_callback, best_model_callback, early_stopping_callback]
-
+    feature_usage_callback = FeatureUsageCallback()
+    callbacks = [comp_logger_callback, log_std_callback, feature_usage_callback, best_model_callback, early_stopping_callback]
     if rclone_dest:
         checkpoint_callback = CheckpointAndRcloneCallback(
             checkpoint_freq=checkpoint_freq,

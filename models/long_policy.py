@@ -8,18 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 torch.autograd.set_detect_anomaly(False)
-from torch.utils.checkpoint import checkpoint
 from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution
-try:
-    from torch.nn.attention import sdpa_kernel
-    with sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
-        pass
-except Exception:
-    pass
 torch.backends.cuda.matmul.allow_tf32 = True
 try:
     torch.set_float32_matmul_precision("high")
@@ -191,7 +184,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
           3) macd_delta  (acceleration, normalized, bounded)
           4) ER_now      (efficiency ratio: trend vs noise)
           5) rolling_corr (vs base asset; confirmations/divergences)
-    Obs per-asset: [open, high, low, close] * window + [elapsed]  (unchanged)
+    Obs per-asset: [open, high, low, close, atr] * window + [elapsed]
     """
     def __init__(
         self,
@@ -208,7 +201,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         obs_dim = int(observation_space.shape[0])
         assert obs_dim % n_assets == 0, f"Obs dim {obs_dim} not divisible by n_assets {n_assets}"
         per_asset = obs_dim // n_assets
-        assert per_asset == 4 * window + 1, f"per_asset={per_asset} != 4*window+1={4*window+1}"
+        assert per_asset == 5 * window + 1, f"per_asset={per_asset} != 5*window+1={5*window+1}"
 
         # Keep features_dim identical to the old extractor: embed_dim + 5 per asset
         super().__init__(observation_space, features_dim=n_assets * (embed_dim + 5))
@@ -218,10 +211,10 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         self.embed_dim = embed_dim
         self._features_dim = n_assets * (embed_dim + 5)
 
-        self.in_ln = nn.LayerNorm(4)
-        self.token = nn.Linear(4, embed_dim)
+        self.in_ln = nn.LayerNorm(5)
+        self.token = nn.Linear(5, embed_dim)
 
-        self.tcn1 = DSConv1d(4, tcn_hidden, k=5, dilation=1, p=dropout * 0.5)
+        self.tcn1 = DSConv1d(5, tcn_hidden, k=5, dilation=1, p=dropout * 0.5)
         self.tcn2 = DSConv1d(tcn_hidden, tcn_hidden, k=5, dilation=2, p=dropout * 0.5)
         self.tcn3 = DSConv1d(tcn_hidden, embed_dim, k=5, dilation=4, p=dropout * 0.5)
         self.se = SE1d(embed_dim, r=8)
@@ -244,11 +237,11 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
         # Project 24 window-level stats → 5 extras per asset (keeps +5 contract)
         self.extras_proj = nn.Linear(24, 5)
         orthogonal_init(self.extras_proj, gain=1.0)
+        self.extras_gate = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         # Keep output projection shape identical for head compatibility
         self.out_proj = nn.Linear(self._features_dim, self._features_dim)
         orthogonal_init(self.out_proj, gain=0.10)
-
         self.register_buffer("asset_idx", torch.arange(n_assets))
         self.register_buffer("time_idx", torch.arange(window))
 
@@ -262,7 +255,7 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
 
         # [B, N, per_asset], then slice bars -> [B, N, W, 4]
         obs = obs.reshape(B, self.n_assets, self.per_asset)
-        bars = obs[:, :, : 4 * self.window].reshape(B, self.n_assets, self.window, 4)
+        bars = obs[:, :, : 5 * self.window].reshape(B, self.n_assets, self.window, 5)
 
         use_amp = torch.cuda.is_available()
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
@@ -270,8 +263,8 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             tok = self.token(self.in_ln(bars))  # [B,N,W,E]
 
             # DS-TCN path on channels-first then back
-            x_cnn = bars.permute(0, 1, 3, 2).contiguous()         # [B,N,4,W]
-            x_cnn = x_cnn.reshape(B * self.n_assets, 4, self.window)
+            x_cnn = bars.permute(0, 1, 3, 2).contiguous()         # [B,N,5,W]
+            x_cnn = x_cnn.reshape(B * self.n_assets, 5, self.window)
             x_cnn = self.tcn3(self.tcn2(self.tcn1(x_cnn)))        # [B*N,E,W]
             x_cnn = self.se(x_cnn)
             x_cnn = x_cnn.permute(0, 2, 1).reshape(B, self.n_assets, self.window, self.embed_dim)
@@ -340,40 +333,43 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
 
         # ── Extras: window-level OHLC features (24 -> project to 5 per asset) ────────
         # Compute stats without tracking grads to save a LOT of memory
+                # ── Extras: window-level OHLC+ATR features (24 -> project to 5 per asset)
         with torch.no_grad():
             eps = 1e-6
             open_  = bars[..., 0]     # [B,N,W]
             high_  = bars[..., 1]
             low_   = bars[..., 2]
             close_ = bars[..., 3]
+            atr_   = bars[..., 4]
 
-            # Current and previous bars
             o_t, h_t, l_t, c_t = open_[..., -1], high_[..., -1], low_[..., -1], close_[..., -1]
             o_p, h_p, l_p, c_p = open_[..., -2], high_[..., -2], low_[..., -2], close_[..., -2]
 
-            # Sequences (safe for log even if inputs were ever normalized)
             close_next = close_[..., 1:].clamp_min(eps)
             close_prev = close_[..., :-1].clamp_min(eps)
-            r_seq = torch.log(close_next / close_prev)                                  # [B,N,W-1]
+            r_seq = torch.log(close_next / close_prev)  # [B,N,W-1]
 
-            R_seq = (high_ - low_).abs()                                             # [B,N,W]
+            R_seq = (high_ - low_).abs()
             R_t   = (h_t - l_t).abs()
             R_p   = (h_p - l_p).abs().clamp_min(eps)
             denp  = c_p.abs().clamp_min(eps)
 
-            # Last-bar / bar-on-bar (6)
-            logret1     = torch.log((c_t + eps) / (c_p + eps))
-            gap_pct     = (o_t - c_p) / denp
-            range_rel   = R_t / denp
-            body_frac   = ((c_t - o_t) / (R_t + eps)).clamp(-1.0, 1.0)
-            up_wick     = (h_t - torch.maximum(o_t, c_t)) / (R_t + eps)
-            dn_wick     = (torch.minimum(o_t, c_t) - l_t) / (R_t + eps)
-            wick_imb    = (up_wick - dn_wick).clamp(-1.0, 1.0)
-            up_break    = F.relu(h_t - h_p) / R_p
-            dn_break    = F.relu(l_p - l_t) / R_p
+            logret1   = torch.log((c_t + eps) / (c_p + eps))
+            gap_pct   = (o_t - c_p) / denp
+
+            # ATR-aware scale feature
+            atr_t   = atr_[..., -1]
+            atr_med = atr_.median(dim=-1).values.clamp_min(eps)
+            atr_pct = torch.tanh(atr_t / atr_med)
+
+            body_frac = ((c_t - o_t) / (R_t + eps)).clamp(-1.0, 1.0)
+            up_wick   = (h_t - torch.maximum(o_t, c_t)) / (R_t + eps)
+            dn_wick   = (torch.minimum(o_t, c_t) - l_t) / (R_t + eps)
+            wick_imb  = (up_wick - dn_wick).clamp(-1.0, 1.0)
+            up_break  = F.relu(h_t - h_p) / R_p
+            dn_break  = F.relu(l_p - l_t) / R_p
             break_score = torch.tanh(up_break - dn_break)
 
-            # Window direction/vol shape (8)
             up_ratio    = (r_seq > 0).float().mean(dim=-1) * 2.0 - 1.0
             s           = torch.sign(r_seq)
             persistence = (s[..., 1:] * s[..., :-1]).mean(dim=-1)
@@ -395,7 +391,6 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             else:
                 range_trend = torch.tanh((R_seq[..., half:].mean(dim=-1) - R_seq[..., :half].mean(dim=-1)) / (R_med))
 
-            # Geometry across window (6)
             body_seq        = ((close_ - open_) / (R_seq + eps)).clamp(-1.0, 1.0)
             body_frac_delta = (body_frac - body_seq.median(dim=-1).values).clamp(-1.0, 1.0)
             up_w_seq        = (high_ - torch.maximum(open_, close_)) / (R_seq + eps)
@@ -412,7 +407,6 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             else:
                 ret_drift_shift = torch.tanh(r_seq[..., half-1:].mean(dim=-1) - r_seq[..., :half-1].mean(dim=-1))
 
-            # Recency vs extremes (4)
             idx_high = torch.argmax(high_, dim=-1).to(dtype=close_.dtype)
             idx_low  = torch.argmin(low_ , dim=-1).to(dtype=close_.dtype)
             den_idx  = float(max(W - 1, 1))
@@ -422,28 +416,30 @@ class LongTermFeatureExtractor(BaseFeaturesExtractor):
             open_pos_prev   = ((o_t - l_p) / (R_p + eps) * 2.0 - 1.0).clamp(-1.0, 1.0)
 
             extras_24 = torch.stack([
-                logret1, gap_pct, range_rel, body_frac, wick_imb, break_score,
+                logret1, gap_pct, atr_pct, body_frac, wick_imb, break_score,
                 up_ratio, persistence, ret_std, ret_skew, ret_kurt, last_ret_z, range_ratio_win, range_trend,
                 body_frac_delta, wick_imb_delta, inside_rate, outside_rate, close_pos_win, ret_drift_shift,
                 bars_since_high, bars_since_low, close_pos_prev, open_pos_prev
             ], dim=-1)   # [B,N,24]
 
-        # Project to 5 per asset; grads only flow into this linear
+        # Project & gate extras (grads flow into extras_proj only)
         extras_24 = torch.nan_to_num(extras_24, nan=0.0, posinf=0.0, neginf=0.0)
         extras_24 = extras_24.clamp_(-50.0, 50.0).to(fdtype)
-        extras_5 = self.extras_proj(extras_24)      # [B,N,5]
-        extras   = extras_5.reshape(B, -1)          # [B, N*5]
+        extras_5  = self.extras_proj(extras_24)                 # [B,N,5]
+        extras    = extras_5.reshape(B, -1)                      # [B, N*5]
+        y_flat    = y.reshape(B, -1)                             # [B, N*E]
 
-        # Concatenate pooled transformer features with extras
-        y_flat = y.reshape(B, -1)                       # [B, N*E]
-        feats = torch.cat([y_flat, extras], dim=1)      # [B, N*(E + 5)]
+        # Logging hooks for FeatureUsageCallback
+        if self.training:
+            self._extras_l1 = extras.abs().mean().detach()
+            self._core_l1   = y_flat.abs().mean().detach()
 
-        # ── NEW: sanitize & bound features to keep matmuls stable
-        feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-        feats = feats.clamp_(-50.0, 50.0)
+        feats = torch.cat([y_flat, self.extras_gate * extras], dim=1)  # gate extras
+        feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-50.0, 50.0)
 
         out = self.out_proj(feats)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
 
     @property
     def features_dim(self) -> int:
