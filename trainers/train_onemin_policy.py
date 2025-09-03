@@ -48,6 +48,10 @@ LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.002
 MIN_MANUAL_HOLD_STEPS = 2
+SL_ILLEGAL_PENALTY = -0.02
+SL_COOLDOWN_STEPS = 2
+SL_EARLY_STEPS = 3
+
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -485,7 +489,7 @@ class OneMinBacktestEnv(gym.Env):
             raise ValueError("max_steps ≤ 0 after clamping")
 
         # Spaces
-        obs_dim = self.n_assets * (4 * self.window + 1)
+        obs_dim = self.n_assets * (5 * self.window + 1)
         self.observation_space = spaces.Box(-np.inf, np.inf, (obs_dim,), np.float32)
         act_dim = self.n_assets * 10  # [one_hot(8), sl_norm, tp_norm] per asset
         self.action_space = spaces.Box(-1.0, 1.0, (act_dim,), np.float32)
@@ -498,7 +502,7 @@ class OneMinBacktestEnv(gym.Env):
         self.last_trade_time = np.zeros(self.n_assets, dtype=np.float32)
         self.open_trades: List[Dict[str, Any]] = []   # one per symbol at most
         self.closed_trades: List[Dict[str, Any]] = [] # rolling buffer
-
+        self.sl_cooldown = np.zeros(self.n_assets, dtype=np.int32)
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
         risk_budget = max(6.0, 0.75 * self.n_assets)
@@ -566,6 +570,7 @@ class OneMinBacktestEnv(gym.Env):
         self.dfs.clear()
         self.arr.clear()
         min_len_after_atr = float("inf")
+        self.sl_cooldown.fill(0)
 
         for sym in self.symbols:
             path = self.data_paths[sym]
@@ -637,8 +642,9 @@ class OneMinBacktestEnv(gym.Env):
             highs  = arr["high"][s:e]
             lows   = arr["low"][s:e]
             closes = arr["close"][s:e]
+            atr    = arr["atr"][s:e] 
 
-            if any(len(a) != ws for a in (opens, highs, lows, closes)):
+            if any(len(a) != ws for a in (opens, highs, lows, closes, atr)):
                 raise RuntimeError(
                     f"[{sym}] expected window={ws} but got "
                     f"o={len(opens)} h={len(highs)} l={len(lows)} c={len(closes)} (idx={idx})"
@@ -652,7 +658,7 @@ class OneMinBacktestEnv(gym.Env):
                 extra = np.array([held if ot["trade_type"] == "long" else -held], dtype=np.float32)
 
             obs_parts.append(
-                np.concatenate([opens, highs, lows, closes, extra], axis=0).astype(np.float32)
+                np.concatenate([opens, highs, lows, closes, atr, extra], axis=0).astype(np.float32)
             )
 
         return np.concatenate(obs_parts, axis=0)
@@ -688,6 +694,9 @@ class OneMinBacktestEnv(gym.Env):
         else:
             # Not in trade -> cannot close/adjust/close-all
             valid[3:8] = False
+            if self.sl_cooldown[i] > 0:
+                valid[1] = False  # buy
+                valid[2] = False  # sell
 
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
@@ -702,6 +711,7 @@ class OneMinBacktestEnv(gym.Env):
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
         any_illegal_attempt = False
+        sl_penalty_total = 0.0
         curr_close_by_sym: Dict[str, float] = {}
         for i, sym in enumerate(self.symbols):
             arr = self.arr[sym]
@@ -756,11 +766,13 @@ class OneMinBacktestEnv(gym.Env):
                     valid[7] = False  # close all
             else:
                 valid[3:8] = False  # cannot close/adjust when flat
+                # mirror cooldown rule used in _mask_illegal_actions
+                if self.sl_cooldown[i] > 0:
+                    valid[1] = False  # buy
+                    valid[2] = False  # sell
             attempted_illegal = not valid[orig_action]
             if attempted_illegal:
                 any_illegal_attempt = True
-
-
             # Prices
             # Use ONLY information available in the current observation (idx-1):
             curr_idx   = idx - 1  # last bar included in the observation slice
@@ -801,6 +813,15 @@ class OneMinBacktestEnv(gym.Env):
                     exit_px = sl if hit_sl else tp
                     pnl = (exit_px - entry) if long_side else (entry - exit_px)
                     stop_type = "sl" if hit_sl else "tp"
+
+                    # NEW: cooldown + penalty on SL (extra penalty if stopped out very fast)
+                    if stop_type == "sl":
+                        self.sl_cooldown[i] = SL_COOLDOWN_STEPS
+                        sl_penalty_total += SL_ILLEGAL_PENALTY
+                        held = self.current_step - ot.get("open_step", self.current_step)
+                        if held <= SL_EARLY_STEPS:
+                            sl_penalty_total += SL_ILLEGAL_PENALTY
+
                     closed = dict(
                         **ot,
                         exit_price=exit_px,
@@ -919,6 +940,15 @@ class OneMinBacktestEnv(gym.Env):
                         exit_px = sl if hit_sl else tp
                         pnl = (exit_px - entry) if long_side else (entry - exit_px)
                         stop_type = "sl" if hit_sl else "tp"
+
+                        # NEW: cooldown + penalty on SL (extra penalty if stopped out very fast)
+                        if stop_type == "sl":
+                            self.sl_cooldown[i] = SL_COOLDOWN_STEPS
+                            sl_penalty_total += SL_ILLEGAL_PENALTY
+                            held = self.current_step - ot.get("open_step", self.current_step)
+                            if held <= SL_EARLY_STEPS:
+                                sl_penalty_total += SL_ILLEGAL_PENALTY
+
                         closed = dict(
                             **ot,
                             exit_price=exit_px,
@@ -1004,6 +1034,7 @@ class OneMinBacktestEnv(gym.Env):
         info["n_closed"] = int(len(info["closed_trades"]))
         info["illegal_attempts"] = int(any_illegal_attempt)
         info["since_last_trade"] = float(global_since_last_trade)
+        reward += sl_penalty_total
         # ──────────────────────────────────────────────────────────────────────────────
         # keep your existing illegal-action penalties
         if any_illegal_attempt:
@@ -1019,6 +1050,8 @@ class OneMinBacktestEnv(gym.Env):
         MAX_CLOSED_TRADES = 1000
         if len(self.closed_trades) > MAX_CLOSED_TRADES:
             self.closed_trades = self.closed_trades[-MAX_CLOSED_TRADES:]
+        
+        self.sl_cooldown[self.sl_cooldown > 0] -= 1
 
         self.current_step += 1
         terminated = self.current_step >= self.runtime_max_steps

@@ -191,7 +191,7 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
           3) macd_delta  (acceleration, normalized, bounded)
           4) ER_now      (efficiency ratio: trend vs noise)
           5) rolling_corr (vs base asset; confirmations/divergences)
-    Obs per-asset: [open, high, low, close] * window + [elapsed]  (unchanged)
+    Obs per-asset: [open, high, low, close, atr] * window + [elapsed]
     """
     def __init__(
         self,
@@ -208,7 +208,7 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         obs_dim = int(observation_space.shape[0])
         assert obs_dim % n_assets == 0, f"Obs dim {obs_dim} not divisible by n_assets {n_assets}"
         per_asset = obs_dim // n_assets
-        assert per_asset == 4 * window + 1, f"per_asset={per_asset} != 4*window+1={4*window+1}"
+        assert per_asset == 5 * window + 1, f"per_asset={per_asset} != 5*window+1={5*window+1}"
 
         # Keep features_dim identical to the old extractor: embed_dim + 5 per asset
         super().__init__(observation_space, features_dim=n_assets * (embed_dim + 5))
@@ -218,10 +218,10 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         self.embed_dim = embed_dim
         self._features_dim = n_assets * (embed_dim + 5)
 
-        self.in_ln = nn.LayerNorm(4)
-        self.token = nn.Linear(4, embed_dim)
+        self.in_ln = nn.LayerNorm(5)
+        self.token = nn.Linear(5, embed_dim)
 
-        self.tcn1 = DSConv1d(4, tcn_hidden, k=5, dilation=1, p=dropout * 0.5)
+        self.tcn1 = DSConv1d(5, tcn_hidden, k=5, dilation=1, p=dropout * 0.5)
         self.tcn2 = DSConv1d(tcn_hidden, tcn_hidden, k=5, dilation=2, p=dropout * 0.5)
         self.tcn3 = DSConv1d(tcn_hidden, embed_dim, k=5, dilation=4, p=dropout * 0.5)
         self.se = SE1d(embed_dim, r=8)
@@ -261,17 +261,19 @@ class OneMinFeatureExtractor(BaseFeaturesExtractor):
         obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
         # [B, N, per_asset], then slice bars -> [B, N, W, 4]
+        # [B, N, per_asset] -> take first 5*W (O,H,L,C,ATR in variable-first blocks)
         obs = obs.reshape(B, self.n_assets, self.per_asset)
-        bars = obs[:, :, : 4 * self.window].reshape(B, self.n_assets, self.window, 4)
-
+        bars5_flat = obs[:, :, : 5 * self.window]  # [B, N, 5W]
+        # Reorder to [B, N, W, 5] so last dim is [O_t, H_t, L_t, C_t, ATR_t]
+        bars = bars5_flat.view(B, self.n_assets, 5, self.window).transpose(2, 3).contiguous()
         use_amp = torch.cuda.is_available()
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             # Token path
             tok = self.token(self.in_ln(bars))  # [B,N,W,E]
 
             # DS-TCN path on channels-first then back
-            x_cnn = bars.permute(0, 1, 3, 2).contiguous()         # [B,N,4,W]
-            x_cnn = x_cnn.reshape(B * self.n_assets, 4, self.window)
+            x_cnn = bars.permute(0, 1, 3, 2).contiguous()         # [B,N,5,W]
+            x_cnn = x_cnn.reshape(B * self.n_assets, 5, self.window)
             x_cnn = self.tcn3(self.tcn2(self.tcn1(x_cnn)))        # [B*N,E,W]
             x_cnn = self.se(x_cnn)
             x_cnn = x_cnn.permute(0, 2, 1).reshape(B, self.n_assets, self.window, self.embed_dim)
