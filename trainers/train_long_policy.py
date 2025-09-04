@@ -1309,7 +1309,7 @@ def train_long_policy(
     total_timesteps: int = 10_000_000,
     n_envs: int = 8,
     checkpoint_freq: int = 10_000,
-    patience: int = 500,
+    patience: int = 1000,
     early_stopping_check_freq: int = 10_000,
 ):
     logging.basicConfig(level=logging.INFO)
