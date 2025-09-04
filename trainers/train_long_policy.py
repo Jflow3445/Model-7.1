@@ -370,9 +370,10 @@ def build_eval_env(make_env_fn, n_envs: int, vecnorm_stats_path: str) -> VecNorm
     envs = [make_env_fn(i, SEED + 10_000 + i, window=LONG_OBS_WINDOW) for i in range(n_envs)]
     base = DummyVecEnv(envs)
     if os.path.exists(vecnorm_stats_path):
-        eval_vec = VecNormalize.load(vecnorm_stats_path, base_env=base)
+        eval_vec = VecNormalize.load(vecnorm_stats_path, venv=base)  # or: VecNormalize.load(vecnorm_stats_path, base)
     else:
         eval_vec = VecNormalize(base, norm_obs=True, norm_reward=True, gamma=0.995, clip_obs=10.0, clip_reward=float("inf"))
+
     eval_vec.training = False
     eval_vec.norm_reward = False  # report raw env reward
     return eval_vec
