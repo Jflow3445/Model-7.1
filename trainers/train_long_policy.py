@@ -846,7 +846,7 @@ class LongBacktestEnv(gym.Env):
     def step(self, action: np.ndarray):
         sl_penalty_total = 0.0
         idx = self.cursor
-        next_idx = idx + 1
+        next_idx = idx
 
         reward = 0.0
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
