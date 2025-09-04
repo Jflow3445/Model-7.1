@@ -663,29 +663,24 @@ class LongBacktestEnv(gym.Env):
             integrate_costs_in_reward=True,
             price_to_ccy_scale=LOT_MULTIPLIER,
 
-            # Robust per-trade R
             min_risk=5e-4,
 
-            # No time pressure while flat
             inactivity_weight=0.0,
             inactivity_grace_steps=4,
 
-            # Gentle holding pressure
             holding_threshold_steps=8,
             holding_penalty_per_step=0.0006,
 
-            # So C1 doesn't dominate when average R is slightly negative early
-            realized_R_weight=8.0,
-            unrealized_weight=0.10,
+            realized_R_weight=5.0,   # was 8.0
+            quality_weight=1.0,      # was 0.6 → make C2 matter
+            unrealized_weight=0.20,  # was 0.10 → reward holding winners a bit more
 
-            # Overexposure is a *soft* guide, not a constant tax
-            risk_budget_R=risk_budget,
+            risk_budget_R=max(2.0, 0.10 * self.n_assets),
             overexposure_weight=0.10,
 
             component_clip=4.0,
             final_clip=6.0,
         )
-
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
         self.runtime_max_steps: int = 0    # per-reset cap after ATR/cleaning across symbols
@@ -1355,7 +1350,7 @@ def train_long_policy(
     vec_env = VecNormalize(
         base_env,
         norm_obs=True,
-        norm_reward=False,
+        norm_reward=True,
         gamma=0.995,
         clip_obs=10.0,               # ── NEW: clip obs to keep them sane
         clip_reward=float("inf"),
@@ -1376,13 +1371,13 @@ def train_long_policy(
     algo_kwargs = dict(
     n_steps=n_steps,
     batch_size=batch_size,
-    learning_rate=3e-4,      
+    learning_rate=1e-4,      
     gamma=0.995,
-    gae_lambda=0.95,
+    gae_lambda=0.92,
     clip_range=0.3,
-    ent_coef=0.01,
-    vf_coef=0.5,
-    max_grad_norm=0.5,
+    ent_coef=0.002,
+    vf_coef=0.25,
+    max_grad_norm=1.0,
     tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
     device="cuda",
     n_epochs=12,            
