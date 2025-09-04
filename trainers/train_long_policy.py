@@ -48,9 +48,9 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = 0
-MIN_MANUAL_HOLD_STEPS = 0
+MIN_MANUAL_HOLD_STEPS = 2
 SL_ILLEGAL_PENALTY   = 0.0
-SL_COOLDOWN_STEPS    = 2
+SL_COOLDOWN_STEPS    = 0
 SL_EARLY_STEPS       = 3
 
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -165,8 +165,8 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     Map normalized [-1,1] to price distances using ATR + broker + price floors.
     Prevents microscopic stops when ATR is tiny.
     """
-    FLOOR_FRAC_ATR = 0.35
-    K_SL_ATR = 1.0
+    FLOOR_FRAC_ATR = 0.45
+    K_SL_ATR = 1.6
     K_TP_ATR = 3.0
 
     # NEW: price-based floor (e.g., 5 bps of price)
@@ -650,7 +650,7 @@ class LongBacktestEnv(gym.Env):
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
-        risk_budget = max(6.0, 0.6 * self.n_assets)
+        risk_budget = max(4.0, 0.35 * self.n_assets)
 
         self.reward_fn = RewardFunction(
         initial_balance=self.initial_balance,
@@ -671,13 +671,13 @@ class LongBacktestEnv(gym.Env):
         holding_penalty_per_step=0.0006,
 
         # slightly lower so C1 less likely to clip after switching to mean
-        realized_R_weight=8.0,
-        unrealized_weight=0.02,
+        realized_R_weight=16.0,
+        unrealized_weight=0.0,
 
         risk_budget_R=risk_budget,
         overexposure_weight=0.03,
         
-        component_clip=2.0,
+        component_clip=4.0,
         final_clip=6.0,
          )
 
@@ -837,9 +837,6 @@ class LongBacktestEnv(gym.Env):
         else:
             # Not in trade -> cannot close/adjust/close-all
             valid[3:8] = False
-            if self.sl_cooldown[i] > 0:
-                valid[1] = False  # buy
-                valid[2] = False  # sell
 
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
