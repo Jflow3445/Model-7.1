@@ -1124,16 +1124,22 @@ class LongBacktestEnv(gym.Env):
         # Compute unrealized PnL using last observed closes (curr_idx), no leakage
         unrealized_pnl = 0.0
         for t in self.open_trades:
-            sym = t["symbol"]
-            cc = curr_close_by_sym.get(sym)
-            if cc is None:
-                ci = max(idx - 1, 0)
-                cc = float(self.arr[sym]["close"][ci])
             entry = float(t["entry_price"])
-            if t["trade_type"] == "long":
-                unrealized_pnl += (cc - entry)
+
+            # If the trade was opened this step, mark to entry so unrealized = 0 at spawn.
+            if int(t.get("open_step", -1)) == self.current_step:
+                price_now = entry
             else:
-                unrealized_pnl += (entry - cc)
+                sym = t["symbol"]
+                price_now = curr_close_by_sym.get(sym)
+                if price_now is None:
+                    ci = max(idx - 1, 0)
+                    price_now = float(self.arr[sym]["close"][ci])
+
+            if t["trade_type"] == "long":
+                unrealized_pnl += (price_now - entry)
+            else:
+                unrealized_pnl += (entry - price_now)
 
         reward = float(self.reward_fn(
             closed_trades=info["closed_trades"],      # may be []
