@@ -672,7 +672,7 @@ class LongBacktestEnv(gym.Env):
 
         # slightly lower so C1 less likely to clip after switching to mean
         realized_R_weight=16.0,
-        unrealized_weight=0.0,
+        unrealized_weight=0.2,
 
         risk_budget_R=risk_budget,
         overexposure_weight=0.03,
