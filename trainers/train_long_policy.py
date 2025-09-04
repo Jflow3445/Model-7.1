@@ -647,14 +647,14 @@ class LongBacktestEnv(gym.Env):
 
         self.last_trade_time = np.zeros(self.n_assets, dtype=np.float32)
         self.open_trades: List[Dict[str, Any]] = []   # one per symbol at most
-        self.max_total_open = int(np.ceil(0.35 * self.n_assets))
+        self.max_total_open = int(np.ceil(0.2 * self.n_assets))
         self.closed_trades: List[Dict[str, Any]] = [] # rolling buffer
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
                 # Allow exploration across many symbols without a constant penalty.
         # If you typically see ~20 concurrent positions, set budget near that.
-        risk_budget = max(6.0, 0.35 * self.n_assets)
+        risk_budget = max(3.0, 0.2 * self.n_assets)
 
         self.reward_fn = RewardFunction(
             initial_balance=self.initial_balance,
@@ -680,7 +680,7 @@ class LongBacktestEnv(gym.Env):
 
             # Overexposure is a *soft* guide, not a constant tax
             risk_budget_R=risk_budget,
-            overexposure_weight=0.05,
+            overexposure_weight=0.10,
 
             component_clip=4.0,
             final_clip=6.0,
@@ -1355,7 +1355,7 @@ def train_long_policy(
     vec_env = VecNormalize(
         base_env,
         norm_obs=True,
-        norm_reward=True,
+        norm_reward=False,
         gamma=0.995,
         clip_obs=10.0,               # ── NEW: clip obs to keep them sane
         clip_reward=float("inf"),
