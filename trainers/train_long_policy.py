@@ -47,11 +47,11 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 # ──────────────────────────────────────────────────────────────────────────────
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
-ILLEGAL_ATTEMPT_PENALTY = -0.002
-MIN_MANUAL_HOLD_STEPS = 2
-SL_ILLEGAL_PENALTY   = -0.02
-SL_COOLDOWN_STEPS    = 8
-SL_EARLY_STEPS       = 5
+ILLEGAL_ATTEMPT_PENALTY = 0
+MIN_MANUAL_HOLD_STEPS = 0
+SL_ILLEGAL_PENALTY   = 0.0
+SL_COOLDOWN_STEPS    = 2
+SL_EARLY_STEPS       = 3
 
 os.makedirs(LOGS_DIR, exist_ok=True)
 
@@ -165,12 +165,12 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     Map normalized [-1,1] to price distances using ATR + broker + price floors.
     Prevents microscopic stops when ATR is tiny.
     """
-    FLOOR_FRAC_ATR = 0.60
-    K_SL_ATR = 1.20
-    K_TP_ATR = 2.80
+    FLOOR_FRAC_ATR = 0.35
+    K_SL_ATR = 1.0
+    K_TP_ATR = 3.0
 
     # NEW: price-based floor (e.g., 5 bps of price)
-    PRICE_FRAC_FLOOR = 1e-3  # 0.10% of price
+    PRICE_FRAC_FLOOR = 5e-4  # 0.05% of price
 
     entry = float(entry)
     atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
@@ -650,7 +650,7 @@ class LongBacktestEnv(gym.Env):
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
-        risk_budget = max(4.0, 0.35 * self.n_assets)
+        risk_budget = max(6.0, 0.6 * self.n_assets)
 
         self.reward_fn = RewardFunction(
         initial_balance=self.initial_balance,
@@ -663,22 +663,22 @@ class LongBacktestEnv(gym.Env):
         min_risk=5e-4,
 
         # time pressure ↓ and only when flat
-        inactivity_weight=0.00005,
-        inactivity_grace_steps=2,
+        inactivity_weight=0.0,
+        inactivity_grace_steps=4,
 
         # holding penalty gentler
-        holding_threshold_steps=5,
+        holding_threshold_steps=8,
         holding_penalty_per_step=0.0006,
 
         # slightly lower so C1 less likely to clip after switching to mean
-        realized_R_weight=10.0,
-        unrealized_weight=0.03,
+        realized_R_weight=8.0,
+        unrealized_weight=0.02,
 
         risk_budget_R=risk_budget,
         overexposure_weight=0.03,
         
-        component_clip=3.0,
-        final_clip=5.0,
+        component_clip=2.0,
+        final_clip=6.0,
          )
 
 
@@ -1367,17 +1367,17 @@ def train_long_policy(
     algo_kwargs = dict(
     n_steps=n_steps,
     batch_size=batch_size,
-    learning_rate=1e-4,        # ── NEW: smaller LR = fewer spikes
+    learning_rate=3e-4,        # ── NEW: smaller LR = fewer spikes
     gamma=0.995,
     gae_lambda=0.95,
     clip_range=0.2,
-    ent_coef=0.01,
+    ent_coef=0.03,
     vf_coef=0.5,
     max_grad_norm=0.5,
     tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
     device="cuda",
-    n_epochs=10,               # ── NEW: fewer epochs, less overfitting per batch
-    target_kl=0.2,             # ── NEW: early-stop updates if policy drifts too far
+    n_epochs=8,               # ── NEW: fewer epochs, less overfitting per batch
+    target_kl=0.15,             # ── NEW: early-stop updates if policy drifts too far
     )
 
     policy_kwargs = dict(
