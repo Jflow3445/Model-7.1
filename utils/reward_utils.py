@@ -402,7 +402,7 @@ class RewardFunction(nn.Module):
         self.last_components = {
             "C1_realizedR": float(C1),
             "C2_quality": float(C2),
-            "C3_unreal": float(delta_unreal_norm),
+            "C3_unreal": float(C3),
             "C4_inactivity": float(C4),
             "C5_holding": float(C5),
             "C6_overexp": float(C6),

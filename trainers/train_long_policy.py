@@ -165,9 +165,9 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     Map normalized [-1,1] to price distances using ATR + broker + price floors.
     Prevents microscopic stops when ATR is tiny.
     """
-    FLOOR_FRAC_ATR = 0.45
-    K_SL_ATR = 1.6
-    K_TP_ATR = 3.0
+    FLOOR_FRAC_ATR = 0.25
+    K_SL_ATR = 1.0
+    K_TP_ATR = 2.5
 
     # NEW: price-based floor (e.g., 5 bps of price)
     PRICE_FRAC_FLOOR = 5e-4  # 0.05% of price
@@ -387,7 +387,8 @@ def evaluate_model(model, eval_env: VecNormalize, episodes: int = 20, determinis
       - Tracks illegal attempts across infos
     """
     n = getattr(eval_env, "num_envs", 1)
-    obs = eval_env.reset()
+    _reset = eval_env.reset()
+    obs = _reset[0] if isinstance(_reset, tuple) else _reset
     ep_ret = np.zeros(n, dtype=np.float64)
     ep_len = np.zeros(n, dtype=np.int32)
     ep_returns: List[float] = []
@@ -646,42 +647,44 @@ class LongBacktestEnv(gym.Env):
 
         self.last_trade_time = np.zeros(self.n_assets, dtype=np.float32)
         self.open_trades: List[Dict[str, Any]] = []   # one per symbol at most
+        self.max_total_open = int(np.ceil(0.60 * self.n_assets))
         self.closed_trades: List[Dict[str, Any]] = [] # rolling buffer
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
 
-        risk_budget = max(4.0, 0.35 * self.n_assets)
+                # Allow exploration across many symbols without a constant penalty.
+        # If you typically see ~20 concurrent positions, set budget near that.
+        risk_budget = max(10.0, 0.90 * self.n_assets)
 
         self.reward_fn = RewardFunction(
-        initial_balance=self.initial_balance,
-        slippage_per_unit=SLIPPAGE_PER_UNIT,
-        commission_per_trade=COMMISSION_PER_TRADE,
-        integrate_costs_in_reward=True,
-        price_to_ccy_scale=LOT_MULTIPLIER,
+            initial_balance=self.initial_balance,
+            slippage_per_unit=SLIPPAGE_PER_UNIT,
+            commission_per_trade=COMMISSION_PER_TRADE,
+            integrate_costs_in_reward=True,
+            price_to_ccy_scale=LOT_MULTIPLIER,
 
-        # NEW: safer R floor; adjust if your price scale differs
-        min_risk=5e-4,
+            # Robust per-trade R
+            min_risk=5e-4,
 
-        # time pressure ↓ and only when flat
-        inactivity_weight=0.0,
-        inactivity_grace_steps=4,
+            # No time pressure while flat
+            inactivity_weight=0.0,
+            inactivity_grace_steps=4,
 
-        # holding penalty gentler
-        holding_threshold_steps=8,
-        holding_penalty_per_step=0.0006,
+            # Gentle holding pressure
+            holding_threshold_steps=8,
+            holding_penalty_per_step=0.0006,
 
-        # slightly lower so C1 less likely to clip after switching to mean
-        realized_R_weight=16.0,
-        unrealized_weight=0.2,
+            # So C1 doesn't dominate when average R is slightly negative early
+            realized_R_weight=8.0,
+            unrealized_weight=0.10,
 
-        risk_budget_R=risk_budget,
-        overexposure_weight=0.03,
-        
-        component_clip=4.0,
-        final_clip=6.0,
-         )
+            # Overexposure is a *soft* guide, not a constant tax
+            risk_budget_R=risk_budget,
+            overexposure_weight=0.01,
 
-
+            component_clip=4.0,
+            final_clip=6.0,
+        )
 
         # Local indexing controls (fix)
         self.cursor: int = 0               # local index within the sliced DataFrame
@@ -837,7 +840,10 @@ class LongBacktestEnv(gym.Env):
         else:
             # Not in trade -> cannot close/adjust/close-all
             valid[3:8] = False
-
+            # Global cap on concurrent positions: when cap reached, forbid new entries
+            if len(self.open_trades) >= self.max_total_open:
+                valid[1] = False  # buy
+                valid[2] = False  # sell
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
         return masked
