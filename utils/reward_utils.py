@@ -114,8 +114,8 @@ class RewardFunction(nn.Module):
         r_clip: float = 5.0,              # clip per-trade R to [-r_clip, r_clip]
 
         # EMA profit quality
-        stats_alpha: float = 0.1,         # EMA smoothing for gross profit/loss
-        quality_weight: float = 0.6,      # weight for C2
+        stats_alpha: float = 0.2,         # EMA smoothing for gross profit/loss
+        quality_weight: float = 1.2,      # weight for C2
 
         # Realized & unrealized mix (dimensionless)
         realized_R_weight: float = 1.0,   # weight for C1
