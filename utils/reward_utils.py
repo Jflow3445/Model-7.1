@@ -206,7 +206,7 @@ class RewardFunction(nn.Module):
         self.register_buffer("ema_gross_profit", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("ema_gross_loss", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("previous_reward", torch.tensor(0.0, dtype=torch.float32))
-
+        self.register_buffer("prev_unreal_value", torch.tensor(0.0))
         # Device
         self.device = device or torch.device("cpu")
         self.to(self.device)
@@ -225,6 +225,7 @@ class RewardFunction(nn.Module):
         self.ema_gross_profit.zero_()
         self.ema_gross_loss.zero_()
         self.previous_reward.zero_()
+        self.prev_unreal_value.zero_() 
 
     # --------------------------
     # Main
@@ -305,10 +306,14 @@ class RewardFunction(nn.Module):
         # Only pay the quality signal on steps that closed trades
         if not closed_trades:
             quality_delta = 0.0
-
-        # --- C3: unrealized normalized by balance (optional, small weight) ---
+        # --- C3: Δ (change in) unrealized, normalized by balance (mark-to-market) ---
         # unrealized_pnl is in PRICE units; scale to currency for consistency
-        unreal_norm = (float(unrealized_pnl) * self.price_to_ccy_scale) / max(self.initial_balance, eps)
+        cur_unreal_value_ccy = float(unrealized_pnl) * self.price_to_ccy_scale
+        prev_unreal_value_ccy = float(self.prev_unreal_value.item())
+        delta_unreal_norm = (cur_unreal_value_ccy - prev_unreal_value_ccy) / max(self.initial_balance, eps)
+        # update baseline for the next step
+        self.prev_unreal_value[...] = cur_unreal_value_ccy
+
 
         # --- C4: inactivity (steps-based) — apply only when FLAT (no open trades) ---
         inactivity_pen = 0.0
@@ -385,7 +390,7 @@ class RewardFunction(nn.Module):
 
         C1 = _clip(self.realized_R_weight * realized_R_mean, c=min(self.component_clip, self.r_clip))
         C2 = _clip(self.quality_weight * quality_delta)
-        C3 = _clip(self.unrealized_weight * unreal_norm)
+        C3 = _clip(self.unrealized_weight * delta_unreal_norm)
         C4 = _clip(inactivity_pen)
         C5 = _clip(holding_pen_total)
         C6 = _clip(overexposure_pen)
@@ -397,7 +402,7 @@ class RewardFunction(nn.Module):
         self.last_components = {
             "C1_realizedR": float(C1),
             "C2_quality": float(C2),
-            "C3_unreal": float(C3),
+            "C3_unreal": float(delta_unreal_norm),
             "C4_inactivity": float(C4),
             "C5_holding": float(C5),
             "C6_overexp": float(C6),
