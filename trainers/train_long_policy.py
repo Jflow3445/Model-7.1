@@ -670,8 +670,8 @@ class LongBacktestEnv(gym.Env):
 
             min_risk=5e-4,
 
-            inactivity_weight=0.02,
-            inactivity_grace_steps=10,
+            inactivity_weight=0.003,
+            inactivity_grace_steps=20,
 
             holding_threshold_steps=8,
             holding_penalty_per_step=0.0006,
