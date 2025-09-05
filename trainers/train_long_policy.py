@@ -20,6 +20,16 @@ from stable_baselines3.common.monitor import Monitor
 import subprocess
 from stable_baselines3.common.vec_env import VecNormalize
 import queue, threading, shutil, atexit, sys
+
+# ── LOGGER SETUP START (add near imports) ─────────────────────────────────────
+LOG_LEVEL = os.getenv("TRAIN_LOG_LEVEL", "WARNING").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.WARNING),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("train_long_policy")
+# ── LOGGER SETUP END ──────────────────────────────────────────────────────────
+
 # Policies / extractor (the recurrent policy may or may not exist in your repo)
 from models.long_policy import (
     LongTermOHLCPolicy,
@@ -48,11 +58,11 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.005
-MIN_MANUAL_HOLD_STEPS = 3
+MIN_MANUAL_HOLD_STEPS = 4
 SL_ILLEGAL_PENALTY   = -0.02
 SL_COOLDOWN_STEPS    = 3
 SL_EARLY_STEPS       = 3
-
+MAX_RISK_FRAC = float(os.getenv("MAX_RISK_FRAC", "0.10"))  # 10% by default
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,7 +81,7 @@ class AsyncUploader:
             self.q.put_nowait(file_path)
             return True
         except queue.Full:
-            print(f"[Checkpoint] upload queue full; skipping {os.path.basename(file_path)}")
+            log.debug("Checkpoint upload queue full; skipping %s", os.path.basename(file_path))
             return False
 
     def _worker(self):
@@ -82,7 +92,7 @@ class AsyncUploader:
                 break
             try:
                 if not os.path.exists(path):
-                    print(f"[Checkpoint] file vanished, skip: {path}")
+                    log.debug("Checkpoint file vanished, skip: %s", path)
                 elif not self.dest:
                     # nothing to do if no remote set
                     pass
@@ -99,9 +109,9 @@ class AsyncUploader:
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,
                                      start_new_session=True)
-                    print(f"[Checkpoint] enqueued → {os.path.basename(path)} -> {self.dest}")
+                    log.info("Checkpoint enqueued: %s -> %s", os.path.basename(path), self.dest)
             except Exception as e:
-                print(f"[Checkpoint] async push error: {e}", file=sys.stderr)
+                log.exception("AsyncUploader error")
             finally:
                 self.q.task_done()
 
@@ -210,8 +220,7 @@ class CheckpointAndRcloneCallback(BaseCallback):
         self.name_prefix = name_prefix
         self.rclone_dest = rclone_dest or os.getenv("RCLONE_DEST", "")
         if not self.rclone_dest:
-            print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
-
+            log.debug("RCLONE_DEST not set; saving locally only.")
     def _on_step(self) -> bool:
         t = int(self.model.num_timesteps)
         if t % self.checkpoint_freq != 0:
@@ -223,8 +232,7 @@ class CheckpointAndRcloneCallback(BaseCallback):
         self.model.save(fpath)
         fzip = fpath + ".zip"
         exists = os.path.exists(fzip)
-        print(f"[Checkpoint] wrote {fzip}  exists={exists}")
-
+        log.info("Checkpoint wrote %s exists=%s", fzip, exists)
         if not exists:
             raise RuntimeError(f"Checkpoint file missing after save: {fzip}")
 
@@ -232,7 +240,7 @@ class CheckpointAndRcloneCallback(BaseCallback):
         if self.rclone_dest and ASYNC_UPLOADER:
             ASYNC_UPLOADER.submit(fzip)  # returns immediately
         else:
-            print("[Checkpoint] No RCLONE_DEST set; skipped remote upload.")
+            log.debug("No RCLONE_DEST set; skipped remote upload.")
         return True
 # ── REPLACEMENT START (SaveTrainBestByEpBuffer + EarlyStopping) ───────────────
 class SaveTrainBestByEpBuffer(BaseCallback):
@@ -256,39 +264,24 @@ class SaveTrainBestByEpBuffer(BaseCallback):
                 return None
         return None
 
-    def _mean_from_monitor_csv(self) -> Optional[float]:
-        results = []
-        for i in range(self.training_env.num_envs):
-            monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
-            if os.path.exists(monitor_file):
-                try:
-                    df = pd.read_csv(monitor_file, skiprows=1)
-                    if "r" in df.columns:
-                        results.extend(df["r"].values[-200:])  # last 200 episodic returns
-                except Exception:
-                    pass
-        if results:
-            return float(np.mean(results))
-        return None
-
     def _on_step(self) -> bool:
         if (int(self.model.num_timesteps) % self.check_freq) != 0:
             return True
 
+        # ── REPLACEMENT inside _on_step (both callbacks) ──────────────────────────────
         mean_r = self._mean_from_ep_buffer()
         if mean_r is None:
-            mean_r = self._mean_from_monitor_csv()
-        if mean_r is None:
-            return True
+            return True  # no disk fallback
+        # ── END REPLACEMENT ───────────────────────────────────────────────────────────
 
         if self.verbose:
-            print(f"[TrainBest] mean={mean_r:.3f} best={self.best_mean:.3f}")
+            log.debug("TrainBest mean=%.3f best=%.3f", mean_r, self.best_mean)
 
         if mean_r > self.best_mean + 1e-4:
             self.best_mean = mean_r
             self.model.save(self.save_path)
             best_zip = self.save_path if self.save_path.endswith(".zip") else self.save_path + ".zip"
-            print(f"[TrainBest] New best → {best_zip}")
+            log.info("TrainBest new best: %s", best_zip)
             if self.rclone_dest and ASYNC_UPLOADER:
                 ASYNC_UPLOADER.submit(best_zip)
         return True
@@ -319,38 +312,18 @@ class EarlyStoppingCallback(EventCallback):
                 return None
         return None
 
-    def _mean_from_monitor_csv(self) -> Optional[float]:
-        results = []
-        for i in range(self.training_env.num_envs):
-            monitor_file = os.path.join(LOGS_DIR, f"long_worker_{i}", "monitor.csv")
-            if os.path.exists(monitor_file):
-                try:
-                    df = pd.read_csv(monitor_file, skiprows=1)
-                    if "r" in df.columns:
-                        results.extend(df["r"].values[-200:])
-                except Exception:
-                    pass
-        if results:
-            return float(np.mean(results))
-        return None
-
     def _on_step(self) -> bool:
         if int(self.model.num_timesteps) % self.check_freq != 0:
             return True
 
         mean_reward = self._mean_from_ep_buffer()
         if mean_reward is None:
-            mean_reward = self._mean_from_monitor_csv()
-        if mean_reward is None:
             return True
-
-        if self.verbose:
-            print(
-                f"[EarlyStopping] step={self.num_timesteps} "
-                f"mean_reward={mean_reward:.3f} best={self.best_mean_reward:.3f} "
-                f"counter={self.counter}/{self.patience}"
-            )
-
+        log.debug(
+        "EarlyStopping step=%s mean=%.3f best=%.3f counter=%d/%d",
+        getattr(self, "num_timesteps", -1), mean_reward, self.best_mean_reward,
+        self.counter, self.patience
+        )
         if mean_reward > self.best_mean_reward + 1e-4:
             self.best_mean_reward = mean_reward
             self.counter = 0
@@ -358,7 +331,7 @@ class EarlyStoppingCallback(EventCallback):
             self.counter += 1
             if self.counter >= self.patience:
                 if self.verbose:
-                    print("[EarlyStopping] Patience exceeded → stopping training.")
+                    log.info("EarlyStopping: patience exceeded, stopping training.")
                 return False
         return True
 
@@ -477,10 +450,11 @@ class EvalAndSaveDeployBestCallback(BaseCallback):
             eval_env.close()
 
         score = eval_score(metrics)
-        if self.verbose:
-            print(f"[DeployEval] score={score:.3f}  "
-                  f"mean={metrics['mean_reward']:.3f} sortino={metrics['sortino']:.3f} "
-                  f"mdd={metrics['max_drawdown']:.3f} ill={metrics['illegal_rate']:.4f}")
+        log.debug(
+        "DeployEval score=%.3f mean=%.3f sortino=%.3f mdd=%.3f ill=%.4f",
+        score, metrics["mean_reward"], metrics["sortino"],
+        metrics["max_drawdown"], metrics["illegal_rate"]
+        )
         self.model.logger.record("eval/score", score)
         for k, v in metrics.items():
             self.model.logger.record(f"eval/{k}", v)
@@ -489,7 +463,7 @@ class EvalAndSaveDeployBestCallback(BaseCallback):
             self.best_score = score
             self.model.save(self.save_path)
             best_zip = self.save_path if self.save_path.endswith(".zip") else self.save_path + ".zip"
-            print(f"[DeployEval] New deploy best → {best_zip}")
+            log.info("DeployEval new best: %s", best_zip)
             if self.rclone_dest and ASYNC_UPLOADER:
                 ASYNC_UPLOADER.submit(best_zip)
         return True
@@ -633,6 +607,41 @@ class LongBacktestEnv(gym.Env):
             self.max_steps = min(int(max_steps), self.max_length - self.window - 1)
         if self.max_steps <= 0:
             raise ValueError("max_steps ≤ 0 after clamping")
+        # ── PRELOAD START (place in __init__, after self.max_length is set) ───────────
+        self.arr_preloaded: Dict[str, Dict[str, np.ndarray]] = {}
+        self.valid_lengths_after_atr: Dict[str, int] = {}
+
+        for sym in self.symbols:
+            path = self.data_paths[sym]
+            # One-time load for the whole CSV
+            df = pd.read_csv(path, parse_dates=["time"])
+            df = _safe_numeric(df)
+
+            # One-time ATR computation (rolling with fallback)
+            atr_roll = compute_atr(df, n=14, mode="rolling")
+
+            if atr_roll.notna().sum() >= self.window + 2:
+                df = df.assign(atr=atr_roll).dropna(subset=["atr"]).reset_index(drop=True)
+            else:
+                atr_wilder = compute_atr(df, n=14, mode="wilder")
+                df = df.assign(atr=atr_wilder).reset_index(drop=True)
+
+            df["atr"] = df["atr"].replace([np.inf, -np.inf], np.nan).clip(lower=1e-12)
+
+            self.arr_preloaded[sym] = {
+                "open":  df["open"].to_numpy(np.float32),
+                "high":  df["high"].to_numpy(np.float32),
+                "low":   df["low"].to_numpy(np.float32),
+                "close": df["close"].to_numpy(np.float32),
+                "atr":   df["atr"].to_numpy(np.float32),
+            }
+            self.valid_lengths_after_atr[sym] = len(df)
+
+        # Use the preloaded arrays for obs/step
+        self.arr = self.arr_preloaded
+        # Align max_length to the shortest preloaded series
+        self.max_length = min(self.valid_lengths_after_atr.values())
+        # ── PRELOAD END ───────────────────────────────────────────────────────────────
 
         # Spaces
         obs_dim = self.n_assets * (5 * self.window + 1)
@@ -647,14 +656,10 @@ class LongBacktestEnv(gym.Env):
 
         self.last_trade_time = np.zeros(self.n_assets, dtype=np.float32)
         self.open_trades: List[Dict[str, Any]] = []   # one per symbol at most
-        self.max_total_open = int(np.ceil(0.2 * self.n_assets))
+        self.max_total_open = int(np.ceil(0.35 * self.n_assets))
         self.closed_trades: List[Dict[str, Any]] = [] # rolling buffer
 
         self.dfs: Dict[str, pd.DataFrame] = {}  # chunked data loaded on reset
-
-                # Allow exploration across many symbols without a constant penalty.
-        # If you typically see ~20 concurrent positions, set budget near that.
-        risk_budget = max(3.0, 0.2 * self.n_assets)
 
         self.reward_fn = RewardFunction(
             initial_balance=self.initial_balance,
@@ -675,7 +680,7 @@ class LongBacktestEnv(gym.Env):
             quality_weight=1.0,      # was 0.6 → make C2 matter
             unrealized_weight=0.20,  # was 0.10 → reward holding winners a bit more
 
-            risk_budget_R=max(2.0, 0.10 * self.n_assets),
+            risk_budget_R=max(4.0, 0.25 * self.n_assets),
             overexposure_weight=0.10,
 
             component_clip=4.0,
@@ -704,79 +709,80 @@ class LongBacktestEnv(gym.Env):
         if seed is not None:
             self.seed(seed)
 
-        low = self.window
-        high = self.max_length - self.max_steps - 1
-        self.start_idx = random.randint(low, high)
+        # episode counters
         self.current_step = 0
-
-        # RAM-efficient load of only the needed rows
-        self.dfs.clear()
-        self.arr.clear()
-        min_len_after_atr = float("inf")
-
-        for sym in self.symbols:
-            path = self.data_paths[sym]
-            needed_rows = self.start_idx + self.max_steps + self.window + 2
-            skip = self.start_idx - self.window if self.start_idx > self.window else 0
-            skiprows = list(range(1, skip + 1)) if skip > 0 else []
-
-            df = pd.read_csv(path, parse_dates=["time"], date_format="ISO8601", skiprows=skiprows, nrows=needed_rows - skip)
-            df = _safe_numeric(df)
-
-            # Compute ATR with strict rolling; fallback to Wilder if too short
-            df["atr"] = compute_atr(df, n=14, mode="rolling")
-            tmp = df.dropna(subset=["atr"])
-            if len(tmp) >= self.window + 2:
-                df = tmp.reset_index(drop=True)
-                df["atr"] = df["atr"].clip(lower=1e-12)
-            else:
-                df["atr"] = compute_atr(df, n=14, mode="wilder").clip(lower=1e-12)
-                df = df.reset_index(drop=True)
-
-            if len(df) < self.window + 2:
-                raise ValueError(f"[{sym}] Not enough Daily bars after ATR handling (have {len(df)}, need {self.window + 2})")
-
-            self.dfs[sym] = df
-            min_len_after_atr = min(min_len_after_atr, len(df))
-
-            # NumPy caches for fast access in _get_observation/step
-            self.arr[sym] = {
-                "open":  df["open"].to_numpy(np.float32),
-                "high":  df["high"].to_numpy(np.float32),
-                "low":   df["low"].to_numpy(np.float32),
-                "close": df["close"].to_numpy(np.float32),
-                "atr":   df["atr"].to_numpy(np.float32),
-            }
-
-
-        # We loaded from (start_idx - window), so "start" within local slices == window
-        self.cursor = self.window
-
-        # After cleaning, clamp per-reset max steps by what's truly aligned across symbols
-        self.runtime_max_steps = min(self.max_steps, int(min_len_after_atr) - self.window - 1)
-        if self.runtime_max_steps <= 0:
-            raise ValueError(
-                f"Not enough aligned Daily bars across symbols after ATR handling "
-                f"(min_len={min_len_after_atr}, window={self.window})"
-            )
-
         self.balance = self.initial_balance
         self.last_trade_time.fill(0.0)
         self.open_trades.clear()
         self.closed_trades.clear()
         self.reward_fn.reset()
 
+        # choose a random start that leaves enough room for window + steps
+        min_len_after_atr = min(self.valid_lengths_after_atr[sym] for sym in self.symbols)
+        # max start so that: start + window + max_steps + 1 <= min_len
+        max_start = min_len_after_atr - self.window - 1 - self.max_steps
+        max_start = max(max_start, self.window)
+        self.start_idx = random.randint(self.window, max_start)
+
+        # base offset into the preloaded arrays
+        self.base = int(self.start_idx)
+
+        # cursor always starts at 'window' within the local episode slice
+        self.cursor = self.window
+
+        # clamp per-episode steps so we never index out of bounds
+        self.runtime_max_steps = min(self.max_steps, min_len_after_atr - self.base - self.window - 1)
+        if self.runtime_max_steps <= 0:
+            raise ValueError(
+                f"Not enough aligned Daily bars across symbols after ATR handling "
+                f"(min_len={min_len_after_atr}, window={self.window})"
+            )
+
+        # first observation
         obs = self._get_observation(self.cursor)
-        # ── NEW: guard against NaN/Inf in observations
         if not np.isfinite(obs).all():
             bad = np.where(~np.isfinite(obs))[0][:10]
             raise RuntimeError(f"NaN/Inf in reset observation at cursor={self.cursor}, first_bad_idxs={bad}")
         return obs.astype(np.float32), {}
+
+    def _equity_estimate(self, idx_local: int) -> float:
+        """
+        Conservative equity estimate at this step using last observed closes
+        (no look-ahead): balance + unrealized PnL marked to previous close.
+        """
+        ci = max(self.base + idx_local - 1, 0)
+        unreal = 0.0
+        for t in self.open_trades:
+            sym = t["symbol"]
+            arr = self.arr[sym]
+            price_now = float(arr["close"][ci])
+            entry = float(t["entry_price"])
+            if t["trade_type"] == "long":
+                unreal += (price_now - entry)
+            else:
+                unreal += (entry - price_now)
+        return float(self.balance + unreal)
+
+    def _risk_usage(self) -> float:
+        """
+        Current worst-case risk across open trades, valued in account currency
+        via LOT_MULTIPLIER (same unit you use in RewardFunction).
+        """
+        tot = 0.0
+        for t in self.open_trades:
+            tot += abs(float(t["entry_price"]) - float(t["stop_loss"])) * float(LOT_MULTIPLIER)
+        return float(tot)
+
+    def _risk_of(self, entry: float, sl: float) -> float:
+        """Worst-case risk for a candidate trade (unit volume)."""
+        return float(abs(float(entry) - float(sl)) * float(LOT_MULTIPLIER))
+
+
     def _get_observation(self, idx: int) -> np.ndarray:
         obs_parts = []
         ws = self.window
-        s = idx - ws
-        e = idx
+        s = self.base + idx - ws
+        e = self.base + idx
 
         for i, sym in enumerate(self.symbols):
             arr = self.arr[sym]
@@ -784,7 +790,7 @@ class LongBacktestEnv(gym.Env):
             highs  = arr["high"][s:e]
             lows   = arr["low"][s:e]
             closes = arr["close"][s:e]
-            atr    = arr["atr"][s:e]   
+            atr    = arr["atr"][s:e]
 
             if any(len(a) != ws for a in (opens, highs, lows, closes, atr)):
                 raise RuntimeError(
@@ -803,6 +809,7 @@ class LongBacktestEnv(gym.Env):
             )
 
         return np.concatenate(obs_parts, axis=0)
+
 
 
     # Single open trade per symbol
@@ -843,27 +850,32 @@ class LongBacktestEnv(gym.Env):
         masked[:8] = np.where(valid, arr[:8], -np.inf)
         return masked
 
-
     def step(self, action: np.ndarray):
         sl_penalty_total = 0.0
         idx = self.cursor
-        next_idx = idx
 
         reward = 0.0
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
         any_illegal_attempt = False
         curr_close_by_sym: Dict[str, float] = {}
+
+                # ---- Account-level risk cap (hard veto) ----
+        equity_est = self._equity_estimate(idx)
+        risk_cap   = float(MAX_RISK_FRAC) * max(1.0, float(equity_est))  # avoid tiny/zero edge
+        curr_risk  = self._risk_usage()
+
+
         for i, sym in enumerate(self.symbols):
             arr = self.arr[sym]
             o = arr["open"]; h = arr["high"]; l = arr["low"]; c = arr["close"]; a = arr["atr"]
             act = action[i * 10: (i + 1) * 10]
+
             # Safety net: never allow >1 open trade per symbol.
             open_for_sym = [t for t in self.open_trades if t["symbol"] == sym]
             if len(open_for_sym) > 1:
-                logging.error(f"[{sym}] Multiple open trades detected; auto-closing extras.")
+                log.error("[%s] Multiple open trades detected; auto-closing extras.", sym)
                 illegal_penalty_total += SEVERE_ILLEGAL_ACTION_PENALTY
-                # Close all but the first at breakeven (costs were charged on open)
                 for extra in open_for_sym[1:]:
                     closed = {
                         **extra,
@@ -877,18 +889,19 @@ class LongBacktestEnv(gym.Env):
                     self.closed_trades.append(closed)
                     self.balance += closed["pnl"]
                     info["closed_trades"].append(closed)
-                # Keep only one
                 keep = open_for_sym[0]
                 self.open_trades = [t for t in self.open_trades if t["symbol"] != sym] + [keep]
 
-            # (A) What the policy *wanted* to do (before masking) — for penalty accounting
+            # (A) Action head the policy WANTED (before masking) — for penalty accounting
             raw_head = np.where(np.isfinite(act[:8]), act[:8], -np.inf)
             orig_action = int(np.argmax(raw_head))
 
-            # (B) Mask invalid heads *before* argmax so sampled==executed (clean credit assignment)
-            masked = self._mask_illegal_actions(i, act)         # sets invalid heads to -inf
+            # (B) Mask invalid heads before argmax so sampled==executed
+            masked = self._mask_illegal_actions(i, act)  # sets invalid heads to -inf
             masked_head = masked[:8]
             act_id = int(np.argmax(masked_head))
+
+            # recompute local validity for "attempted_illegal" flag
             valid = np.ones(8, dtype=bool)
             ot = self._get_open_trade(sym)
             if ot is not None:
@@ -896,27 +909,26 @@ class LongBacktestEnv(gym.Env):
                 valid[2] = False  # sell
                 if ot["trade_type"] == "long":
                     valid[4] = False  # can't close short
-                elif ot["trade_type"] == "short":
+                else:
                     valid[3] = False  # can't close long
-
-                # Enforce minimum hold before manual close (mirror _mask_illegal_actions)
                 held = self.current_step - ot.get("open_step", self.current_step)
                 if held < MIN_MANUAL_HOLD_STEPS:
-                    valid[3] = False  # close long
-                    valid[4] = False  # close short
-                    valid[7] = False  # close all
+                    valid[3] = False
+                    valid[4] = False
+                    valid[7] = False
             else:
-                valid[3:8] = False  # cannot close/adjust when flat
+                valid[3:8] = False
+                if len(self.open_trades) >= self.max_total_open:
+                    valid[1] = False
+                    valid[2] = False
             attempted_illegal = not valid[orig_action]
             if attempted_illegal:
                 any_illegal_attempt = True
 
+            # Indexing (episode-local → absolute)
+            next_idx = self.base + idx
+            curr_idx = max(self.base + idx - 1, 0)
 
-            # Prices
-            # Use ONLY information available in the current observation (idx-1):
-            curr_idx   = idx - 1  # last bar included in the observation slice
-            if curr_idx < 0:
-                curr_idx = 0
             curr_close = float(c[curr_idx])
             atr_val    = float(a[curr_idx])
             curr_close_by_sym[sym] = curr_close
@@ -926,7 +938,6 @@ class LongBacktestEnv(gym.Env):
             next_low   = float(l[next_idx])
 
             min_stop_price = float(self.broker_meta.get(sym, {}).get("min_stop_price", 0.0))
-
             sl_norm = float(act[8])
             tp_norm = float(act[9])
 
@@ -942,7 +953,6 @@ class LongBacktestEnv(gym.Env):
                 hit_tp = (next_high >= tp) if long_side else (next_low <= tp)
 
                 if hit_sl and hit_tp:
-                    # first-touch proxy by proximity to next_open
                     sl_dist = abs(next_open - sl)
                     tp_dist = abs(next_open - tp)
                     prefer_sl = sl_dist <= tp_dist
@@ -952,13 +962,14 @@ class LongBacktestEnv(gym.Env):
                     exit_px = sl if hit_sl else tp
                     pnl = (exit_px - entry) if long_side else (entry - exit_px)
                     stop_type = "sl" if hit_sl else "tp"
-                    # NEW: cooldown + penalty on SL (extra if stopped very fast)
+
                     if stop_type == "sl":
                         self.sl_cooldown[i] = SL_COOLDOWN_STEPS
                         sl_penalty_total += SL_ILLEGAL_PENALTY
                         held_bars = self.current_step - ot.get("open_step", self.current_step)
                         if held_bars <= SL_EARLY_STEPS:
                             sl_penalty_total += SL_ILLEGAL_PENALTY
+
                     closed = dict(
                         **ot,
                         exit_price=exit_px,
@@ -975,8 +986,6 @@ class LongBacktestEnv(gym.Env):
                     trade_executed = True
 
             # --- Action: only if nothing executed yet ---
-            # --- Post-check: if still open now, allow SL/TP hits — but NOT for trades opened this step ---
-            # --- Action: only if nothing executed yet ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)  # refresh
 
@@ -986,25 +995,31 @@ class LongBacktestEnv(gym.Env):
                         entry=entry, sl_norm=sl_norm, tp_norm=tp_norm,
                         is_long=True, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
-                    self._open_trade(sym, "long", entry, sl_final, tp_final)
-                    trade_executed = True
-
+                    add_risk = self._risk_of(entry, sl_final)
+                    if (curr_risk + add_risk) <= risk_cap:
+                        self._open_trade(sym, "long", entry, sl_final, tp_final)
+                        curr_risk += add_risk
+                        trade_executed = True
+                    else:
+                        info["symbols"][sym] = {**info["symbols"].get(sym, {}), "risk_veto": True}
                 elif act_id == 2 and ot is None:  # sell
                     entry = next_open
                     sl_final, tp_final = _scale_sl_tp(
                         entry=entry, sl_norm=sl_norm, tp_norm=tp_norm,
                         is_long=False, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
-                    self._open_trade(sym, "short", entry, sl_final, tp_final)
-                    trade_executed = True
+                    add_risk = self._risk_of(entry, sl_final)
+                    if (curr_risk + add_risk) <= risk_cap:
+                        self._open_trade(sym, "short", entry, sl_final, tp_final)
+                        curr_risk += add_risk
+                        trade_executed = True
+                    else:
+                        info["symbols"][sym] = {**info["symbols"].get(sym, {}), "risk_veto": True}
+
 
                 elif act_id in (3, 4, 7) and ot is not None:
-                    # Manual close at NEXT OPEN (only if not already SL/TP-closed above)
                     exit_px = next_open
-                    if ot["trade_type"] == "long":
-                        pnl = exit_px - ot["entry_price"]
-                    else:
-                        pnl = ot["entry_price"] - exit_px
+                    pnl = (exit_px - ot["entry_price"]) if ot["trade_type"] == "long" else (ot["entry_price"] - exit_px)
                     closed = dict(
                         **ot,
                         exit_price=exit_px,
@@ -1021,10 +1036,9 @@ class LongBacktestEnv(gym.Env):
                     trade_executed = True
 
                 elif act_id == 5 and ot is not None:
-                    # Adjust Stop-Loss using the LAST OBSERVED close as reference (curr_close)
                     ref_price = curr_close
                     is_long = (ot["trade_type"] == "long")
-                    new_sl, _unused = _scale_sl_tp(
+                    new_sl, _ = _scale_sl_tp(
                         entry=ref_price, sl_norm=sl_norm, tp_norm=0.0,
                         is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
@@ -1042,10 +1056,9 @@ class LongBacktestEnv(gym.Env):
                     info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "sl"}
 
                 elif act_id == 6 and ot is not None:
-                    # Adjust Take-Profit using the LAST OBSERVED close as reference (curr_close)
                     ref_price = curr_close
                     is_long = (ot["trade_type"] == "long")
-                    _unused, new_tp = _scale_sl_tp(
+                    _, new_tp = _scale_sl_tp(
                         entry=ref_price, sl_norm=0.0, tp_norm=tp_norm,
                         is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
@@ -1057,7 +1070,7 @@ class LongBacktestEnv(gym.Env):
                     ot["take_profit"] = float(new_tp)
                     info["symbols"][sym] = {**info["symbols"].get(sym, {}), "adjusted": "tp"}
 
-            # --- Post-check: if still open now, allow SL/TP hits — but NOT for trades opened this step ---
+            # --- Post-check: allow SL/TP hits if still open and not opened this step ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)
                 if ot is not None and ot.get("open_step", -1) != self.current_step:
@@ -1078,7 +1091,6 @@ class LongBacktestEnv(gym.Env):
                         pnl = (exit_px - entry) if long_side else (entry - exit_px)
                         stop_type = "sl" if hit_sl else "tp"
 
-                        # NEW: cooldown + penalty on SL (extra if stopped very fast)
                         if stop_type == "sl":
                             self.sl_cooldown[i] = SL_COOLDOWN_STEPS
                             sl_penalty_total += SL_ILLEGAL_PENALTY
@@ -1101,8 +1113,6 @@ class LongBacktestEnv(gym.Env):
                         info["closed_trades"].append(closed)
                         trade_executed = True
 
-
-
             self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
             info["symbols"][sym] = {
                 **info["symbols"].get(sym, {}),
@@ -1116,59 +1126,43 @@ class LongBacktestEnv(gym.Env):
 
         # include holding_time for open trades so C5 works
         open_trades_for_reward = []
-        
         for t in self.open_trades:
             td = dict(t)
             td["holding_time"] = self.current_step - td.get("open_step", self.current_step)
             open_trades_for_reward.append(td)
 
-        # Compute unrealized PnL using last observed closes (curr_idx), no leakage
+        # Compute unrealized PnL using last observed closes (no leakage)
         unrealized_pnl = 0.0
         for t in self.open_trades:
             entry = float(t["entry_price"])
-
-            # If the trade was opened this step, mark to entry so unrealized = 0 at spawn.
             if int(t.get("open_step", -1)) == self.current_step:
                 price_now = entry
             else:
                 sym = t["symbol"]
                 price_now = curr_close_by_sym.get(sym)
                 if price_now is None:
-                    ci = max(idx - 1, 0)
+                    ci = max(self.base + idx - 1, 0)
                     price_now = float(self.arr[sym]["close"][ci])
-
             if t["trade_type"] == "long":
                 unrealized_pnl += (price_now - entry)
             else:
                 unrealized_pnl += (entry - price_now)
 
         reward = float(self.reward_fn(
-            closed_trades=info["closed_trades"],      # may be []
-            open_trades=open_trades_for_reward,       # includes holding_time
+            closed_trades=info["closed_trades"],
+            open_trades=open_trades_for_reward,
             account_balance=self.balance,
             unrealized_pnl=float(unrealized_pnl),
             time_since_last_trade=global_since_last_trade
         ).item())
-        # ── NEW: never let reward be NaN/Inf
         if not np.isfinite(reward):
             reward = 0.0
 
-
-        info["reward_components"] = getattr(self.reward_fn, "last_components", None)
-        # Stop-type counts for this step
-        info["c_sl"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "sl")
-        info["c_tp"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "tp")
-        info["c_manual"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "manual")
-
-        # ── Diagnostics to log via Monitor (flatten keys) ─────────────────────────────
+        # log reward components flat in info
         rc = getattr(self.reward_fn, "last_components", {}) or {}
-        for k in (
-        "C1_realizedR", "C2_quality", "C3_unreal", "C4_inactivity",
-        "C5_holding", "C6_overexp", "C7_conflict", "C8_churnSLTP",
-        "realized_R_mean",  # NEW: per-step mean R of closes
-        "total_before_clip",
-        ):
-
+        for k in ("C1_realizedR","C2_quality","C3_unreal","C4_inactivity",
+                "C5_holding","C6_overexp","C7_conflict","C8_churnSLTP",
+                "realized_R_mean","total_before_clip"):
             v = rc.get(k, None)
             if v is not None:
                 info[f"rw_{k}"] = float(v)
@@ -1177,24 +1171,24 @@ class LongBacktestEnv(gym.Env):
         info["n_closed"] = int(len(info["closed_trades"]))
         info["illegal_attempts"] = int(any_illegal_attempt)
         info["since_last_trade"] = float(global_since_last_trade)
-        # ──────────────────────────────────────────────────────────────────────────────
-        # keep your existing illegal-action penalties
-        # keep your existing illegal-action penalties
+        info["c_sl"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "sl")
+        info["c_tp"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "tp")
+        info["c_manual"] = sum(1 for ct in info["closed_trades"] if ct.get("stop_type") == "manual")
+
         if any_illegal_attempt:
             reward += ILLEGAL_ATTEMPT_PENALTY
-
-        # add severe illegal penalty and SL shaping
         reward += float(illegal_penalty_total)
         reward += float(sl_penalty_total)
 
-        # final clip AFTER penalties
         final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
         reward = float(np.clip(reward, -final_cap, final_cap))
-        # Keep only recent closed trades
+
+        # housekeeping
         MAX_CLOSED_TRADES = 1000
         if len(self.closed_trades) > MAX_CLOSED_TRADES:
             self.closed_trades = self.closed_trades[-MAX_CLOSED_TRADES:]
         self.sl_cooldown = np.maximum(self.sl_cooldown - 1, 0)
+
         self.current_step += 1
         terminated = self.current_step >= self.runtime_max_steps
         truncated = False
@@ -1205,13 +1199,13 @@ class LongBacktestEnv(gym.Env):
         else:
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
-        # ── NEW: guard against NaN/Inf in observations
         if not np.isfinite(obs).all():
             raise RuntimeError(
                 f"NaN/Inf in observation at step={self.current_step}, idx={self.cursor}, symbols={self.symbols}"
             )
         return obs, float(reward), terminated, truncated, info
 
+    
     def _open_trade(self, sym: str, direction: str, entry: float, sl: float, tp: float):
         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]  # ensure at most one
         risk_at_open = abs(float(entry) - float(sl))
@@ -1253,20 +1247,7 @@ def make_long_env(rank: int, seed: int, window: int, symbols=None) -> Callable[[
         env.seed(seed + rank)
         log_dir = os.path.join(LOGS_DIR, f"long_worker_{rank}")
         os.makedirs(log_dir, exist_ok=True)
-        env = Monitor(
-        env,
-        filename=os.path.join(log_dir, "monitor.csv"),
-        info_keywords=(
-            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
-            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
-            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
-            "rw_realized_R_mean",              # NEW
-            "rw_total_before_clip",
-            "c_sl", "c_tp", "c_manual",        # NEW
-             ),
-             )
-
-
+        env = Monitor(env)  # <-- add this
         return env
     return _init
 
@@ -1313,15 +1294,13 @@ class FeatureUsageCallback(BaseCallback):
 # ──────────────────────────────────────────────────────────────────────────────
 def train_long_policy(
     window: int = LONG_OBS_WINDOW,
-    total_timesteps: int = 10_000_000,
+    total_timesteps: int = 100_000_000,
     n_envs: int = 8,
-    checkpoint_freq: int = 10_000,
-    patience: int = 1000,
+    checkpoint_freq: int = 1_000_000,
+    patience: int = 10_000,
     early_stopping_check_freq: int = 10_000,
 ):
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("train_long_policy")
-    logger.info("Starting Long-term training with PPO and event-based reward.")
+    log.info("Starting Long-term training with PPO and event-based reward.")
     # Clean stale monitor files so new rw_* columns are written in the header
     try:
         for i in range(n_envs):
@@ -1330,9 +1309,9 @@ def train_long_policy(
             mon_csv = os.path.join(_log_dir, "monitor.csv")
             if os.path.exists(mon_csv):
                 os.remove(mon_csv)
-                print(f"[Monitor] Removed stale {mon_csv} to refresh headers.")
+                log.debug("Monitor removed stale %s to refresh headers.", mon_csv)
     except Exception as e:
-        print(f"[Monitor] Cleanup skipped: {e}")
+        log.debug("Monitor cleanup skipped: %s", e)
     # VecEnv
     # VecEnv (+ VecNormalize load/resume)
     env_fns = [make_long_env(i, SEED, window) for i in range(n_envs)]
@@ -1343,10 +1322,9 @@ def train_long_policy(
     if os.path.exists(pkl_path):
         try:
             os.remove(pkl_path)
-            print(f"[VecNormalize] Deleted stale stats at {pkl_path}")
+            log.info("VecNormalize deleted stale stats at %s", pkl_path)
         except Exception as e:
-            print(f"[VecNormalize] Could not delete {pkl_path}: {e}")
-
+            log.debug("VecNormalize could not delete %s: %s", pkl_path, e)
     vec_env = VecNormalize(
         base_env,
         norm_obs=True,
@@ -1361,7 +1339,7 @@ def train_long_policy(
         if rollout % cand == 0:
             batch_size = cand
             break
-    print(f"[train_long] n_steps={n_steps} n_envs={n_envs} batch_size={batch_size} rollout={rollout}")
+    log.info("[train_long] n_steps=%d n_envs=%d batch_size=%d rollout=%d", n_steps, n_envs, batch_size, rollout)
     check_every = rollout
     
     assert (n_steps * n_envs) % batch_size == 0, "n_steps * n_envs must be divisible by batch_size."
@@ -1403,10 +1381,10 @@ def train_long_policy(
     target_total_timesteps = int(total_timesteps)
 
     if resume_path:
-        print(f"Resuming from checkpoint: {resume_path}")
+        log.info("Resuming from checkpoint: %s", resume_path)
         model = algo_cls.load(resume_path, env=vec_env, device="cuda")
         already_trained = getattr(model, "num_timesteps", steps_from_ckpt_name(resume_path))
-        print(f"Already trained (model counter): {already_trained} steps")
+        log.info("Already trained steps: %d", already_trained)
         timesteps_left = max(target_total_timesteps - already_trained, 0)
     else:
         model = algo_cls(
@@ -1425,7 +1403,7 @@ def train_long_policy(
     try:
         vec_env.save(vecnorm_stats_path)
     except Exception as e:
-        print(f"[VecNormalize] Initial stats snapshot failed: {e}")
+        log.debug("VecNormalize initial stats snapshot failed: %s", e)
 
     comp_logger_callback = LogRewardComponentsCallback(section="rollout", verbose=0)
     log_std_callback = LogStdCallback()
@@ -1439,12 +1417,12 @@ def train_long_policy(
         verbose=1,
     )
 
-    rollouts_per_eval = 5  # tune to taste (5–10 typical)
+    rollouts_per_eval = 20  # tune to taste (5–10 typical)
     deploy_best_cb = EvalAndSaveDeployBestCallback(
         vecnorm_stats_path=vecnorm_stats_path,
         make_env_fn=lambda rank, seed, window: make_long_env(rank, seed + 12345, window, symbols=LIVE_FOREX_PAIRS),
         n_eval_envs=max(1, n_envs // 2),
-        episodes=max(10, n_envs),
+        episodes = max(5, n_envs // 2),
         check_freq=rollouts_per_eval * check_every,
         save_path=os.path.join(ckpt_dir, "long_policy_deploybest.zip"),
         rclone_dest=rclone_dest,
@@ -1475,7 +1453,7 @@ def train_long_policy(
         )
         callbacks.insert(0, checkpoint_callback)
     else:
-        print("[Checkpoint] RCLONE_DEST not set; saving locally only.")
+        log.debug("RCLONE_DEST not set; saving locally only.")
     # ── REPLACEMENT END ────────────────────────────────────────────────────────
     # ── Train & save (same pattern as onemin) ────────────────────────────────
     try:
@@ -1490,13 +1468,13 @@ def train_long_policy(
             # persist VecNormalize running stats for clean resumes
             try:
                 vec_env.save(os.path.join(ckpt_dir, "vecnormalize.pkl"))
-                print(f"[VecNormalize] Saved running stats -> {os.path.join(ckpt_dir, 'vecnormalize.pkl')}")
+                log.info("VecNormalize saved running stats to %s", os.path.join(ckpt_dir, "vecnormalize.pkl"))
             except Exception as e:
-                print(f"[VecNormalize] Could not save stats: {e}")
+                log.warning("VecNormalize could not save stats: %s", e)
 
-            logger.info(f"Training complete. Model saved to {main_save_path} and {last_ckpt_path}")
+            log.info("Training complete. Model saved to %s and %s", main_save_path, last_ckpt_path)
         else:
-            logger.info(f"Training already completed by checkpoint/model counter: >= target {target_total_timesteps}")
+            log.info("Training already completed by checkpoint/model counter: >= target %d", target_total_timesteps)
     finally:
         if ASYNC_UPLOADER:
             ASYNC_UPLOADER.wait()  # drain queue at the very end only
