@@ -58,7 +58,7 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.005
-MIN_MANUAL_HOLD_STEPS = 4
+MIN_MANUAL_HOLD_STEPS = 2
 SL_ILLEGAL_PENALTY   = -0.02
 SL_COOLDOWN_STEPS    = 3
 SL_EARLY_STEPS       = 3
@@ -175,12 +175,12 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     Map normalized [-1,1] to price distances using ATR + broker + price floors.
     Prevents microscopic stops when ATR is tiny.
     """
-    FLOOR_FRAC_ATR = 0.40
-    K_SL_ATR = 1.6
+    FLOOR_FRAC_ATR = 0.30
+    K_SL_ATR = 1.2
     K_TP_ATR = 2.5
 
     # NEW: price-based floor (e.g., 5 bps of price)
-    PRICE_FRAC_FLOOR = 1e-3  # 0.05% of price
+    PRICE_FRAC_FLOOR = 5e-4  # 0.05% of price
 
     entry = float(entry)
     atr_value = float(atr_value) if np.isfinite(atr_value) else 0.0
@@ -505,13 +505,16 @@ class LogRewardComponentsCallback(BaseCallback):
         super().__init__(verbose)
         self.section = section
         self.keys = keys or [
-        "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
-        "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
-        "rw_realized_R_mean",              # NEW
-        "rw_total_before_clip",
-        "n_open", "n_closed", "illegal_attempts", "since_last_trade",
-        "c_sl", "c_tp", "c_manual",        # NEW
+            "rw_C1_realizedR", "rw_C2_quality", "rw_C3_unreal", "rw_C4_inactivity",
+            "rw_C5_holding", "rw_C6_overexp", "rw_C7_conflict", "rw_C8_churnSLTP",
+            "rw_realized_R_mean",
+            "rw_total_before_clip",
+            "n_open", "n_closed", "illegal_attempts", "since_last_trade",
+            "c_sl", "c_tp", "c_manual",
+            "risk_veto_count",           # NEW
+            "explore_bonus",             # NEW
         ]
+
 
         self._sums = {}
         self._counts = {}
@@ -670,15 +673,15 @@ class LongBacktestEnv(gym.Env):
 
             min_risk=5e-4,
 
-            inactivity_weight=0.003,
-            inactivity_grace_steps=20,
+            inactivity_weight=0.015,
+            inactivity_grace_steps=5,
 
             holding_threshold_steps=8,
-            holding_penalty_per_step=0.0006,
+            holding_penalty_per_step=0.0004,
 
-            realized_R_weight=5.0,   # was 8.0
-            quality_weight=1.0,      # was 0.6 → make C2 matter
-            unrealized_weight=0.20,  # was 0.10 → reward holding winners a bit more
+            realized_R_weight=3.0, 
+            quality_weight=1.0,
+            unrealized_weight=0.3,
 
             risk_budget_R=max(4.0, 0.25 * self.n_assets),
             overexposure_weight=0.10,
@@ -762,6 +765,11 @@ class LongBacktestEnv(gym.Env):
             else:
                 unreal += (entry - price_now)
         return float(self.balance + unreal)
+    def set_inactivity_weight(self, w: float):
+        try:
+            self.reward_fn.inactivity_weight = float(w)
+        except Exception:
+            pass
 
     def _risk_usage(self) -> float:
         """
@@ -853,19 +861,15 @@ class LongBacktestEnv(gym.Env):
     def step(self, action: np.ndarray):
         sl_penalty_total = 0.0
         idx = self.cursor
-
         reward = 0.0
         info: Dict[str, Any] = {"symbols": {}, "closed_trades": []}
         illegal_penalty_total = 0.0
         any_illegal_attempt = False
         curr_close_by_sym: Dict[str, float] = {}
-
-                # ---- Account-level risk cap (hard veto) ----
+        explore_bonus = 0.0 
         equity_est = self._equity_estimate(idx)
         risk_cap   = float(MAX_RISK_FRAC) * max(1.0, float(equity_est))  # avoid tiny/zero edge
         curr_risk  = self._risk_usage()
-
-
         for i, sym in enumerate(self.symbols):
             arr = self.arr[sym]
             o = arr["open"]; h = arr["high"]; l = arr["low"]; c = arr["close"]; a = arr["atr"]
@@ -984,7 +988,9 @@ class LongBacktestEnv(gym.Env):
                     self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                     info["closed_trades"].append(closed)
                     trade_executed = True
-
+                    # Reward breaking long inactivity on this symbol
+                    if self.last_trade_time[i] >= 10:  # ~50 daily bars idle
+                        explore_bonus += 0.05
             # --- Action: only if nothing executed yet ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)  # refresh
@@ -1000,6 +1006,10 @@ class LongBacktestEnv(gym.Env):
                         self._open_trade(sym, "long", entry, sl_final, tp_final)
                         curr_risk += add_risk
                         trade_executed = True
+                        # Reward breaking long inactivity on this symbol
+                        if self.last_trade_time[i] >= 10:  # ~50 daily bars idle
+                            explore_bonus += 0.05
+
                     else:
                         info["symbols"][sym] = {**info["symbols"].get(sym, {}), "risk_veto": True}
                 elif act_id == 2 and ot is None:  # sell
@@ -1013,10 +1023,11 @@ class LongBacktestEnv(gym.Env):
                         self._open_trade(sym, "short", entry, sl_final, tp_final)
                         curr_risk += add_risk
                         trade_executed = True
+                        # Reward breaking long inactivity on this symbol
+                        if self.last_trade_time[i] >= 10:  # ~50 daily bars idle
+                            explore_bonus += 0.05
                     else:
                         info["symbols"][sym] = {**info["symbols"].get(sym, {}), "risk_veto": True}
-
-
                 elif act_id in (3, 4, 7) and ot is not None:
                     exit_px = next_open
                     pnl = (exit_px - ot["entry_price"]) if ot["trade_type"] == "long" else (ot["entry_price"] - exit_px)
@@ -1034,7 +1045,9 @@ class LongBacktestEnv(gym.Env):
                     self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                     info["closed_trades"].append(closed)
                     trade_executed = True
-
+                    # Reward breaking long inactivity on this symbol
+                    if self.last_trade_time[i] >=10:  # ~50 daily bars idle
+                        explore_bonus += 0.05
                 elif act_id == 5 and ot is not None:
                     ref_price = curr_close
                     is_long = (ot["trade_type"] == "long")
@@ -1042,7 +1055,7 @@ class LongBacktestEnv(gym.Env):
                         entry=ref_price, sl_norm=sl_norm, tp_norm=0.0,
                         is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
-                    floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                    floor_price = max(float(min_stop_price or 0.0), 0.30 * atr_val)
                     old_sl = float(ot["stop_loss"])
                     if is_long:
                         upper_bound = min(ot["take_profit"] - floor_price, ref_price - floor_price)
@@ -1062,7 +1075,7 @@ class LongBacktestEnv(gym.Env):
                         entry=ref_price, sl_norm=0.0, tp_norm=tp_norm,
                         is_long=is_long, min_stop_price=min_stop_price, atr_value=atr_val,
                     )
-                    floor_price = max(float(min_stop_price or 0.0), 0.40 * atr_val)
+                    floor_price = max(float(min_stop_price or 0.0), 0.30 * atr_val)
                     if is_long:
                         new_tp = max(new_tp, ot["stop_loss"] + floor_price, ref_price + floor_price)
                     else:
@@ -1112,7 +1125,9 @@ class LongBacktestEnv(gym.Env):
                         self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                         info["closed_trades"].append(closed)
                         trade_executed = True
-
+                        # Reward breaking long inactivity on this symbol
+                        if self.last_trade_time[i] >= 10:  # ~50 daily bars idle
+                            explore_bonus += 0.05
             self.last_trade_time[i] = 0.0 if trade_executed else (self.last_trade_time[i] + 1.0)
             info["symbols"][sym] = {
                 **info["symbols"].get(sym, {}),
@@ -1155,9 +1170,10 @@ class LongBacktestEnv(gym.Env):
             unrealized_pnl=float(unrealized_pnl),
             time_since_last_trade=global_since_last_trade
         ).item())
+        reward += float(explore_bonus)
+        info["explore_bonus"] = float(explore_bonus)
         if not np.isfinite(reward):
             reward = 0.0
-
         # log reward components flat in info
         rc = getattr(self.reward_fn, "last_components", {}) or {}
         for k in ("C1_realizedR","C2_quality","C3_unreal","C4_inactivity",
@@ -1182,7 +1198,8 @@ class LongBacktestEnv(gym.Env):
 
         final_cap = getattr(self.reward_fn, "final_clip", 5.0) or 5.0
         reward = float(np.clip(reward, -final_cap, final_cap))
-
+        risk_vetos = sum(1 for s in info["symbols"].values() if s.get("risk_veto"))
+        info["risk_veto_count"] = float(risk_vetos)
         # housekeeping
         MAX_CLOSED_TRADES = 1000
         if len(self.closed_trades) > MAX_CLOSED_TRADES:
@@ -1288,6 +1305,26 @@ class FeatureUsageCallback(BaseCallback):
         except Exception:
             pass
         return True
+class AdjustInactivityWeightCallback(BaseCallback):
+    def __init__(self, start_w: float, end_w: float, end_steps: int):
+        super().__init__(verbose=0)
+        self.start_w = float(start_w)
+        self.end_w = float(end_w)
+        self.end_steps = int(end_steps)
+
+    def _on_step(self) -> bool:
+        t = int(self.model.num_timesteps)
+        if t >= self.end_steps:
+            w = self.end_w
+        else:
+            # linear decay
+            w = self.start_w + (self.end_w - self.start_w) * (t / max(1, self.end_steps))
+        try:
+            # Fan-out to all subproc envs
+            self.model.get_env().env_method("set_inactivity_weight", w)
+        except Exception:
+            pass
+        return True
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Training (mirrors onemin structure, prefers recurrent)
@@ -1353,13 +1390,13 @@ def train_long_policy(
     gamma=0.995,
     gae_lambda=0.92,
     clip_range=0.3,
-    ent_coef=0.002,
+    ent_coef=0.01,
     vf_coef=0.25,
     max_grad_norm=1.0,
     tensorboard_log=os.path.join(LOGS_DIR, "tb_long_policy"),
     device="cuda",
     n_epochs=12,            
-    target_kl=0.08,       
+    target_kl=0.12,       
     )
 
     policy_kwargs = dict(
@@ -1443,6 +1480,12 @@ def train_long_policy(
         deploy_best_cb,
         early_stopping_callback,
     ]
+    # Decay inactivity from 0.015 → 0.003 over first ~2M steps
+    adjust_inactivity_cb = AdjustInactivityWeightCallback(
+        start_w=0.015, end_w=0.003, end_steps=2_000_000
+    )
+    callbacks.append(adjust_inactivity_cb)
+
 
     if rclone_dest:
         checkpoint_callback = CheckpointAndRcloneCallback(
