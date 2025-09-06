@@ -58,7 +58,7 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.005
-MIN_MANUAL_HOLD_STEPS = 1
+MIN_MANUAL_HOLD_STEPS = 2
 SL_ILLEGAL_PENALTY   = -0.02
 SL_COOLDOWN_STEPS    = 3
 SL_EARLY_STEPS       = 3
@@ -854,6 +854,10 @@ class LongBacktestEnv(gym.Env):
             if len(self.open_trades) >= self.max_total_open:
                 valid[1] = False  # buy
                 valid[2] = False  # sell
+                # Block new entries on this symbol while in SL cooldown
+        if self.sl_cooldown[i] > 0:
+            valid[1] = False  # buy
+            valid[2] = False  # sell
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
         return masked
@@ -946,6 +950,26 @@ class LongBacktestEnv(gym.Env):
             tp_norm = float(act[9])
 
             trade_executed = False
+
+                        # --- Simple auto-breakeven trailing to cut losers early ---
+            ot = self._get_open_trade(sym)
+            if ot is not None:
+                long_side = (ot["trade_type"] == "long")
+                entry = float(ot["entry_price"])
+                old_sl = float(ot["stop_loss"])
+                held_bars = self.current_step - ot.get("open_step", self.current_step)
+
+                # Only consider after a few bars, and if move >= 0.75 * ATR in our favor
+                if held_bars >= SL_EARLY_STEPS and np.isfinite(atr_val) and atr_val > 0.0:
+                    moved_ok = (curr_close - entry) >= 0.75 * atr_val if long_side else (entry - curr_close) >= 0.75 * atr_val
+                    if moved_ok:
+                        be = entry  # breakeven
+                        if long_side and be > old_sl:
+                            ot["stop_loss"] = float(be)
+                        elif (not long_side) and be < old_sl:
+                            ot["stop_loss"] = float(be)
+
+
 
             # --- Pre-check: SL/TP for an existing open trade on the next bar ---
             ot = self._get_open_trade(sym)
