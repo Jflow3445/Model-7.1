@@ -854,10 +854,12 @@ class LongBacktestEnv(gym.Env):
             if len(self.open_trades) >= self.max_total_open:
                 valid[1] = False  # buy
                 valid[2] = False  # sell
-                # Block new entries on this symbol while in SL cooldown
+
+        # Block new entries on this symbol while in SL cooldown (applies in or out of a trade)
         if self.sl_cooldown[i] > 0:
             valid[1] = False  # buy
             valid[2] = False  # sell
+
         masked = arr.copy()
         masked[:8] = np.where(valid, arr[:8], -np.inf)
         return masked
@@ -951,7 +953,7 @@ class LongBacktestEnv(gym.Env):
 
             trade_executed = False
 
-                        # --- Simple auto-breakeven trailing to cut losers early ---
+            # --- Simple auto-breakeven trailing to cut losers early ---
             ot = self._get_open_trade(sym)
             if ot is not None:
                 long_side = (ot["trade_type"] == "long")
