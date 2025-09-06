@@ -58,11 +58,11 @@ BROKER_STOPS_JSON = Path(BASE_DIR) / "config" / "broker_stops.json"
 LOGS_DIR = os.path.join(MODELS_DIR, "logs")
 SEVERE_ILLEGAL_ACTION_PENALTY = -2
 ILLEGAL_ATTEMPT_PENALTY = -0.005
-MIN_MANUAL_HOLD_STEPS = 2
+MIN_MANUAL_HOLD_STEPS = 1
 SL_ILLEGAL_PENALTY   = -0.02
 SL_COOLDOWN_STEPS    = 3
 SL_EARLY_STEPS       = 3
-MAX_RISK_FRAC = float(os.getenv("MAX_RISK_FRAC", "0.10"))  # 10% by default
+MAX_RISK_FRAC = float(os.getenv("MAX_RISK_FRAC", "0.25"))
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,9 +175,9 @@ def _scale_sl_tp(entry: float, sl_norm: float, tp_norm: float,
     Map normalized [-1,1] to price distances using ATR + broker + price floors.
     Prevents microscopic stops when ATR is tiny.
     """
-    FLOOR_FRAC_ATR = 0.30
-    K_SL_ATR = 1.2
-    K_TP_ATR = 2.5
+    FLOOR_FRAC_ATR = 0.15
+    K_SL_ATR = 0.8
+    K_TP_ATR = 3.0
 
     # NEW: price-based floor (e.g., 5 bps of price)
     PRICE_FRAC_FLOOR = 5e-4  # 0.05% of price
@@ -988,9 +988,11 @@ class LongBacktestEnv(gym.Env):
                     self.open_trades = [t for t in self.open_trades if t["symbol"] != sym]
                     info["closed_trades"].append(closed)
                     trade_executed = True
-                    # Reward breaking long inactivity on this symbol
-                    if self.last_trade_time[i] >= 10:  # ~50 daily bars idle
-                        explore_bonus += 0.05
+                    idle = self.last_trade_time[i]
+                    if idle >= 5:
+                        # scale bonus with idle time, capped; helps break local minima of not trading
+                        explore_bonus += min(0.15, 0.01 * idle)
+
             # --- Action: only if nothing executed yet ---
             if not trade_executed:
                 ot = self._get_open_trade(sym)  # refresh
@@ -1480,10 +1482,11 @@ def train_long_policy(
         deploy_best_cb,
         early_stopping_callback,
     ]
-    # Decay inactivity from 0.015 → 0.003 over first ~2M steps
+    # Keep a gentle pressure to trade, but not overwhelming
     adjust_inactivity_cb = AdjustInactivityWeightCallback(
-        start_w=0.015, end_w=0.003, end_steps=2_000_000
+        start_w=0.015, end_w=0.0015, end_steps=2_000_000
     )
+
     callbacks.append(adjust_inactivity_cb)
 
 
